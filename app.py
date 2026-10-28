@@ -9,6 +9,9 @@ from collections import deque
 from pathlib import Path
 
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
+
+from telegram_control import TelegramControlBot
 
 
 ROOT = Path(__file__).resolve().parent
@@ -28,7 +31,8 @@ def load_bot_module():
 class BackgroundRunner:
     """One in-process worker shared by Streamlit sessions."""
 
-    def __init__(self):
+    def __init__(self, bot_module):
+        self._bot_module = bot_module
         self._lock = threading.RLock()
         self._logs = deque(maxlen=1000)
         self._thread = None
@@ -48,7 +52,7 @@ class BackgroundRunner:
             return list(self._logs), self._error
 
     def start(self, owner_email, owner_password, child_email, child_password, target):
-        bot = load_bot_module()
+        bot = self._bot_module
         with self._lock:
             if self.is_running():
                 return False
@@ -114,7 +118,12 @@ class BackgroundRunner:
 
 @st.cache_resource
 def get_runner():
-    return BackgroundRunner()
+    return BackgroundRunner(load_bot_module())
+
+
+@st.cache_resource
+def get_telegram_controller():
+    return TelegramControlBot()
 
 
 def require_secrets():
@@ -124,14 +133,20 @@ def require_secrets():
         "OWNER_PASSWORD",
         "CHILD_EMAIL",
         "CHILD_PASSWORD",
+        "TELEGRAM_BOT_TOKEN",
+        "ADMIN_ID",
     )
-    missing = [key for key in required if not st.secrets.get(key)]
+    try:
+        configured = st.secrets.to_dict()
+    except StreamlitSecretNotFoundError:
+        configured = {}
+    missing = [key for key in required if not configured.get(key)]
     if missing:
         st.error("إعداد الأسرار غير مكتمل. أضف المفاتيح المطلوبة في Streamlit Secrets.")
         st.code("\n".join(missing))
         st.info("راجع ملف `.streamlit/secrets.toml.example` لمعرفة شكل الإعداد.")
         st.stop()
-    return {key: str(st.secrets[key]) for key in required}
+    return {key: str(configured[key]) for key in required}
 
 
 def authenticate(app_password):
@@ -149,11 +164,27 @@ def authenticate(app_password):
     return False
 
 
-st.set_page_config(page_title="Etisalat Mix Bot", page_icon="📶", layout="wide")
-st.title("📶 لوحة تشغيل بوت ميكسات اتصالات")
-st.caption("تعمل واجهة التحكم بينما ينفّذ العامل الدورة في الخلفية داخل عملية Streamlit.")
+st.set_page_config(page_title="Etisalat Telegram Bot", page_icon="📶", layout="wide")
+st.title("📶 بوت ميكسات اتصالات على Telegram")
+st.caption("أوامر Telegram للمسؤول المعتمد، مع لوحة Streamlit لمتابعة الحالة والسجل.")
 
 secrets = require_secrets()
+runner = get_runner()
+try:
+    admin_id = int(secrets["ADMIN_ID"])
+except ValueError:
+    st.error("قيمة ADMIN_ID لازم تكون رقم Telegram User ID صحيحًا.")
+    st.stop()
+
+telegram_control = get_telegram_controller()
+telegram_control.configure(
+    token=secrets["TELEGRAM_BOT_TOKEN"],
+    admin_id=admin_id,
+    runner=runner,
+    credentials=secrets,
+)
+telegram_control.start()
+
 if not authenticate(secrets["APP_ACCESS_PASSWORD"]):
     st.stop()
 
@@ -162,10 +193,15 @@ st.warning(
     "تأكد من صلاحية الحسابات والتكلفة قبل البدء."
 )
 
-runner = get_runner()
-
 @st.fragment(run_every="2s")
 def live_panel():
+    telegram_running, telegram_error = telegram_control.status()
+    st.subheader("حالة بوت Telegram")
+    st.write("🟢 متصل ويستقبل الأوامر" if telegram_running else "🟠 جاري الاتصال أو متوقف")
+    if telegram_error:
+        st.error(f"مشكلة في تشغيل Telegram: {telegram_error}")
+    st.caption("في Telegram ابعت /start للبوت، ثم استخدم /help لعرض الأوامر.")
+
     with st.form("run_form"):
         target = st.number_input("هدف الميكسات", min_value=1, value=50000, step=5000)
         confirmed = st.checkbox("أؤكد أنني راجعت الحسابات وأوافق على العمليات الفعلية")
@@ -209,7 +245,7 @@ with st.expander("ملاحظات مهمة"):
     st.markdown(
         "- بيانات الحسابات وكلمة مرور اللوحة تُقرأ من `st.secrets` ولا تظهر في الواجهة.\n"
         "- لا ترفع ملف `secrets.toml` أو بيانات حساباتك إلى GitHub.\n"
-        "- هذا المشروع ليس بوت Telegram: لا يوجد في الكود الحالي استخدام لـ `BOT_TOKEN` أو `ADMIN_ID`.\n"
-        "- العامل يعمل داخل عملية Streamlit؛ إذا أُعيد تشغيل التطبيق أو نامت الاستضافة فسيتوقف.\n"
+        "- أوامر Telegram متاحة فقط للمستخدم الذي يطابق `ADMIN_ID`، والتشغيل يحتاج تأكيدًا قبل بدء العمليات.\n"
+        "- البوت والعامل يعملان داخل عملية Streamlit؛ إذا أُعيد تشغيل التطبيق أو نامت الاستضافة فسيتوقفان.\n"
         "- كلمة مرور اللوحة طبقة حماية بسيطة، وليست بديلًا عن تقييد الوصول للتطبيق من إعدادات الاستضافة."
     )
