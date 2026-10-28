@@ -1,8 +1,7 @@
-"""Streamlit control panel for the Etisalat mix automation script."""
+"""Streamlit host/status page for the admin-only Telegram bot."""
 
 from __future__ import annotations
 
-import hmac
 import importlib.util
 import threading
 from collections import deque
@@ -29,7 +28,7 @@ def load_bot_module():
 
 
 class BackgroundRunner:
-    """One in-process worker shared by Streamlit sessions."""
+    """Run one automation task at a time using credentials supplied per run."""
 
     def __init__(self, bot_module):
         self._bot_module = bot_module
@@ -74,7 +73,7 @@ class BackgroundRunner:
             self._stop_requested = True
             if self._loop is not None:
                 self._loop.stop()
-            self.add_log("⏹ طُلب إيقاف البوت؛ سيقف بعد انتهاء الطلب الحالي.")
+            self.add_log("⏹ طُلب إيقاف التشغيل؛ سيقف بعد انتهاء طلب الشبكة الحالي.")
 
     def _run(self, bot, owner_email, owner_password, child_email, child_password, target):
         bot.LOG_SINK = self.add_log
@@ -83,7 +82,7 @@ class BackgroundRunner:
             owner = bot.EtisalatAPI()
             if not owner.login(owner_email, owner_password):
                 raise RuntimeError("فشل تسجيل دخول الأونر. راجع البيانات أو حالة الحساب.")
-            self.add_log(f"تم تسجيل دخول الأونر — Dial: {owner.current_dial}")
+            self.add_log("تم تسجيل دخول الأونر.")
 
             if self._stop_requested:
                 return
@@ -92,7 +91,7 @@ class BackgroundRunner:
             child = bot.EtisalatAPI()
             if not child.login(child_email, child_password):
                 raise RuntimeError("فشل تسجيل دخول الفرد. راجع البيانات أو حالة الحساب.")
-            self.add_log(f"تم تسجيل دخول الفرد — Dial: {child.current_dial}")
+            self.add_log("تم تسجيل دخول الفرد.")
 
             if self._stop_requested:
                 return
@@ -109,7 +108,7 @@ class BackgroundRunner:
         except Exception as exc:
             with self._lock:
                 self._error = str(exc)
-            self.add_log(f"❌ خطأ: {exc}")
+            self.add_log(f"❌ خطأ أثناء التشغيل: {exc}")
         finally:
             bot.LOG_SINK = None
             with self._lock:
@@ -127,125 +126,60 @@ def get_telegram_controller():
 
 
 def require_secrets():
-    required = (
-        "APP_ACCESS_PASSWORD",
-        "OWNER_EMAIL",
-        "OWNER_PASSWORD",
-        "CHILD_EMAIL",
-        "CHILD_PASSWORD",
-        "TELEGRAM_BOT_TOKEN",
-        "ADMIN_ID",
-    )
+    required = ("TELEGRAM_BOT_TOKEN", "ADMIN_ID")
     try:
         configured = st.secrets.to_dict()
     except StreamlitSecretNotFoundError:
         configured = {}
     missing = [key for key in required if not configured.get(key)]
     if missing:
-        st.error("إعداد الأسرار غير مكتمل. أضف المفاتيح المطلوبة في Streamlit Secrets.")
+        st.error("أضف أسرار Telegram المطلوبة في إعدادات Streamlit.")
         st.code("\n".join(missing))
-        st.info("راجع ملف `.streamlit/secrets.toml.example` لمعرفة شكل الإعداد.")
+        st.info("استخدم شكل الإعداد الموجود في `.streamlit/secrets.toml.example`.")
         st.stop()
     return {key: str(configured[key]) for key in required}
 
 
-def authenticate(app_password):
-    if st.session_state.get("authenticated"):
-        return True
-    st.subheader("دخول لوحة التحكم")
-    with st.form("access_form"):
-        entered = st.text_input("كلمة مرور لوحة التحكم", type="password")
-        submitted = st.form_submit_button("دخول", type="primary")
-    if submitted:
-        if hmac.compare_digest(entered, app_password):
-            st.session_state.authenticated = True
-            st.rerun()
-        st.error("كلمة المرور غير صحيحة.")
-    return False
-
-
-st.set_page_config(page_title="Etisalat Telegram Bot", page_icon="📶", layout="wide")
+st.set_page_config(page_title="Etisalat Telegram Bot", page_icon="📶", layout="centered")
 st.title("📶 بوت ميكسات اتصالات على Telegram")
-st.caption("أوامر Telegram للمسؤول المعتمد، مع لوحة Streamlit لمتابعة الحالة والسجل.")
+st.caption("تُدخل بيانات حسابات اتصالات داخل محادثة البوت عند كل تشغيل؛ لا تحتاج إضافتها إلى Secrets.")
 
 secrets = require_secrets()
-runner = get_runner()
 try:
     admin_id = int(secrets["ADMIN_ID"])
 except ValueError:
     st.error("قيمة ADMIN_ID لازم تكون رقم Telegram User ID صحيحًا.")
     st.stop()
 
+runner = get_runner()
 telegram_control = get_telegram_controller()
 telegram_control.configure(
     token=secrets["TELEGRAM_BOT_TOKEN"],
     admin_id=admin_id,
     runner=runner,
-    credentials=secrets,
 )
 telegram_control.start()
 
-if not authenticate(secrets["APP_ACCESS_PASSWORD"]):
-    st.stop()
-
-st.warning(
-    "التشغيل ينفّذ عمليات حقيقية على الحساب: تجديد باقة، تغيير نظام، وتحويل ميكسات. "
-    "تأكد من صلاحية الحسابات والتكلفة قبل البدء."
-)
-
-@st.fragment(run_every="2s")
-def live_panel():
-    telegram_running, telegram_error = telegram_control.status()
-    st.subheader("حالة بوت Telegram")
-    st.write("🟢 متصل ويستقبل الأوامر" if telegram_running else "🟠 جاري الاتصال أو متوقف")
+@st.fragment(run_every="3s")
+def status_panel():
+    polling, _ = telegram_control.status()
+    st.subheader("حالة اتصال Telegram")
+    st.write("🟢 البوت متصل ويستقبل الأوامر" if polling else "🟠 البوت يحاول الاتصال أو متوقف")
     if telegram_error:
-        st.error(f"مشكلة في تشغيل Telegram: {telegram_error}")
-    st.caption("في Telegram ابعت /start للبوت، ثم استخدم /help لعرض الأوامر.")
-
-    with st.form("run_form"):
-        target = st.number_input("هدف الميكسات", min_value=1, value=50000, step=5000)
-        confirmed = st.checkbox("أؤكد أنني راجعت الحسابات وأوافق على العمليات الفعلية")
-        start_clicked = st.form_submit_button(
-            "تشغيل البوت في الخلفية",
-            type="primary",
-            disabled=runner.is_running(),
-        )
-
-    if start_clicked:
-        if not confirmed:
-            st.error("علّم مربع التأكيد قبل التشغيل.")
-        elif runner.start(
-            secrets["OWNER_EMAIL"],
-            secrets["OWNER_PASSWORD"],
-            secrets["CHILD_EMAIL"],
-            secrets["CHILD_PASSWORD"],
-            int(target),
-        ):
-            st.success("بدأ العامل في الخلفية. اترك التطبيق يعمل لمتابعة الدورة.")
-        else:
-            st.info("يوجد تشغيل قائم بالفعل.")
+        st.error("تعذّر الاتصال. راجع TELEGRAM_BOT_TOKEN وسجل تشغيل Streamlit.")
 
     running = runner.is_running()
-    st.subheader("حالة التشغيل")
-    st.write("🟢 يعمل في الخلفية" if running else "⚪ متوقف")
-    if running and st.button("إيقاف بعد الطلب الحالي", key="stop_bot"):
-        runner.stop()
-    logs, error = runner.snapshot()
-    if error:
-        st.error(error)
-    st.subheader("السجل")
-    if logs:
-        st.code("\n".join(logs[-250:]), language=None)
-    else:
-        st.caption("لا توجد رسائل بعد.")
+    st.subheader("حالة دورة اتصالات")
+    st.write("🟢 يوجد تشغيل" if running else "⚪ لا يوجد تشغيل")
 
 
-live_panel()
-with st.expander("ملاحظات مهمة"):
-    st.markdown(
-        "- بيانات الحسابات وكلمة مرور اللوحة تُقرأ من `st.secrets` ولا تظهر في الواجهة.\n"
-        "- لا ترفع ملف `secrets.toml` أو بيانات حساباتك إلى GitHub.\n"
-        "- أوامر Telegram متاحة فقط للمستخدم الذي يطابق `ADMIN_ID`، والتشغيل يحتاج تأكيدًا قبل بدء العمليات.\n"
-        "- البوت والعامل يعملان داخل عملية Streamlit؛ إذا أُعيد تشغيل التطبيق أو نامت الاستضافة فسيتوقفان.\n"
-        "- كلمة مرور اللوحة طبقة حماية بسيطة، وليست بديلًا عن تقييد الوصول للتطبيق من إعدادات الاستضافة."
-    )
+status_panel()
+st.warning(
+    "أوامر التشغيل متاحة فقط للمسؤول المحدد في ADMIN_ID، ومن محادثة خاصة. "
+    "التشغيل قد يجدد باقات ويحوّل ميكسات، وهذه عمليات فعلية."
+)
+st.info("في Telegram: أرسل /start ثم /help. لبدء دورة استخدم /run 50000.")
+st.caption(
+    "استضافة Streamlit قد تنام أو تعيد التشغيل؛ عندها يتوقف البوت والدورة. "
+    "للتشغيل الدائم 24/7 استخدم استضافة عامل تعمل باستمرار."
+)
