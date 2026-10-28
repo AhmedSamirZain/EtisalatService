@@ -1,33 +1,44 @@
-# Etisalat Mix Bot — Streamlit control panel
+# Etisalat Mix Telegram Bot (hosted with Streamlit)
 
-This repository contains a Streamlit control panel (`app.py`) for the existing Etisalat automation script (`etisalat mix.py`). The bot logs in to the owner and child accounts, then can renew a bundle, migrate plans, and transfer mixes. These are real account operations and may incur charges.
+This project exposes the existing Etisalat mix automation through an **admin-only Telegram bot** and a Streamlit status/control page. Telegram commands are `/start`, `/help`, `/status`, `/run <mix_target>`, and `/stop`. `/run` asks for an inline confirmation before it starts.
+
+The automation can renew bundles, migrate plans, and transfer mixes. These are real account operations and may incur charges. Verify the account and cost before confirming a run.
+
+## Deploy on Streamlit Community Cloud
+
+1. Create a Telegram bot with **@BotFather** and copy its token. Keep the token private.
+2. Find your numeric Telegram user ID (the administrator who is allowed to control this bot). Use your personal user ID, not a group/chat ID.
+3. Install/deploy this GitHub repository in Streamlit Community Cloud. Set the main file to `app.py`.
+4. In the app's **Settings → Secrets**, add the keys from `.streamlit/secrets.toml.example`, replacing every example with your values. Required keys:
+   - `APP_ACCESS_PASSWORD`: password for the Streamlit dashboard.
+   - `OWNER_EMAIL`, `OWNER_PASSWORD`: Etisalat owner account.
+   - `CHILD_EMAIL`, `CHILD_PASSWORD`: Etisalat child account.
+   - `TELEGRAM_BOT_TOKEN`: token from @BotFather.
+   - `ADMIN_ID`: numeric Telegram user ID authorized to issue commands.
+5. Deploy/reboot the app. The Telegram polling worker starts when the Streamlit app process starts. Open the bot in Telegram, send `/start`, then `/help`.
+
+Never commit `.streamlit/secrets.toml` or paste real tokens/passwords into GitHub or chat. The example file is safe to commit; it contains placeholders only.
+
+## Commands
+
+- `/start` or `/help` — instructions.
+- `/status` — automation status and recent log lines.
+- `/run 50000` — request an automation run for that target; confirm via the button in Telegram. The accepted target is 1 to 1,000,000 mixes.
+- `/stop` — request a stop after the current API call finishes.
+
+Only private Telegram messages from the account whose numeric user ID matches `ADMIN_ID` are authorized. Keep the bot token private and do not run another polling instance with the same token, or Telegram may reject duplicate polling.
 
 ## Local run
 
-1. Install Python 3.9 or newer.
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and replace the sample values with your real values. Never commit the real secrets file.
-4. Start the app:
-   ```bash
-   streamlit run app.py --server.address 0.0.0.0
-   ```
+```bash
+python -m venv .venv
+. .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+pip install -r requirements.txt
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+# Edit .streamlit/secrets.toml with your actual secrets, then:
+streamlit run app.py
+```
 
-## Streamlit Community Cloud
+## Hosting limitation
 
-1. Push this repository to GitHub.
-2. In Streamlit Community Cloud, create an app from this repository and choose `app.py` as the main file.
-3. In the app's **Settings → Secrets**, add the values shown in `.streamlit/secrets.toml.example`. Do not add real credentials to GitHub.
-4. Restrict app access using the hosting platform's access controls. The app also has a shared dashboard-password gate (`APP_ACCESS_PASSWORD`), but that alone is not a substitute for platform access controls.
-
-The app uses one background thread inside the Streamlit process. It is not a durable worker: if the hosted app sleeps, restarts, or is redeployed, the automation stops. Keep the app running and watch its status/log panel.
-
-## Secret keys
-
-- `APP_ACCESS_PASSWORD`: shared password for the dashboard.
-- `OWNER_EMAIL`, `OWNER_PASSWORD`: Etisalat owner account credentials.
-- `CHILD_EMAIL`, `CHILD_PASSWORD`: Etisalat child account credentials.
-
-The current Python script is not a Telegram bot and does not read a Telegram `BOT_TOKEN` or `ADMIN_ID`; those values are intentionally not included or used. Add them only if a Telegram integration is implemented.
+Telegram uses long polling in a background thread inside the Streamlit process. It runs only while the hosted app process is awake. Streamlit Community Cloud may sleep/restart an app, which will stop the Telegram bot and any active automation; check the Streamlit dashboard and bot status after restarts. For guaranteed 24/7 Telegram availability, use an always-on worker host instead of relying on a sleeping Streamlit instance.
