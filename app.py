@@ -162,7 +162,7 @@ telegram_control.start()
 
 @st.fragment(run_every="3s")
 def status_panel():
-    polling, _ = telegram_control.status()
+    polling, telegram_error = telegram_control.status()
     st.subheader("حالة اتصال Telegram")
     st.write("🟢 البوت متصل ويستقبل الأوامر" if polling else "🟠 البوت يحاول الاتصال أو متوقف")
     if telegram_error:
