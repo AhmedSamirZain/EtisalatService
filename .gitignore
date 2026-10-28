@@ -1,0 +1,12 @@
+# Secrets must never be committed.
+.streamlit/secrets.toml
+.streamlit/secrets.toml.*
+!.streamlit/secrets.toml.example
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# Local virtual environments
+.venv/
+venv/
