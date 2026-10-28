@@ -40,8 +40,16 @@ class C:
     GRAY   = "\033[90m"
 
 
+# Optional callback used by the Streamlit UI to display background-thread logs.
+LOG_SINK = None
+
+
 def log(msg, color=C.RESET, prefix=""):
-    print(f"{color}{prefix}{msg}{C.RESET}")
+    formatted = f"{color}{prefix}{msg}{C.RESET}"
+    if LOG_SINK is not None:
+        LOG_SINK(f"{prefix}{msg}")
+    else:
+        print(formatted)
 
 
 def log_ok(msg):    log(f"✅ {msg}", C.GREEN)
@@ -445,10 +453,7 @@ class AutoLoop:
 
             # ---- إعادة تسجيل الأونر ----
             log_info("إعادة تسجيل دخول الأونر...")
-            new_api = EtisalatAPI()
-            if new_api.login(self.owner_dial_email if hasattr(self, 'owner_dial_email') else '', ''):
-                pass  # سيتم استبدالها لاحقاً
-            # (نستخدم البيانات الأصلية)
+            # Re-authenticate with the original owner credentials after plan migration.
             new_owner_api = EtisalatAPI()
             if new_owner_api.login(self.owner_email, self.owner_pass):
                 self.owner = new_owner_api
