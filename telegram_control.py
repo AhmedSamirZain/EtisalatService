@@ -12,14 +12,18 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
 
 
 MAX_TARGET_MIX = 1_000_000
+(CONSENT, OWNER_EMAIL, OWNER_PASSWORD, CHILD_EMAIL, CHILD_PASSWORD, CONFIRM_RUN) = range(6)
 
 
 class TelegramControlBot:
-    """Run Telegram long polling in a managed background thread."""
+    """Run Telegram long polling and collect per-run credentials in memory only."""
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -29,10 +33,9 @@ class TelegramControlBot:
         self._token: str | None = None
         self._admin_id: int | None = None
         self._runner: Any = None
-        self._credentials: dict[str, str] = {}
         self._error: str | None = None
 
-    def configure(self, token: str, admin_id: int, runner: Any, credentials: dict[str, str]):
+    def configure(self, token: str, admin_id: int, runner: Any):
         with self._lock:
             if self.is_running() and (token != self._token or admin_id != self._admin_id):
                 self._error = "Telegram settings changed; restart the Streamlit app to apply them."
@@ -40,7 +43,6 @@ class TelegramControlBot:
             self._token = token
             self._admin_id = admin_id
             self._runner = runner
-            self._credentials = dict(credentials)
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -90,12 +92,28 @@ class TelegramControlBot:
             raise RuntimeError("Telegram bot token is missing.")
 
         application = Application.builder().token(token).build()
+        conversation = ConversationHandler(
+            entry_points=[CommandHandler("run", self._run_command)],
+            states={
+                CONSENT: [CallbackQueryHandler(self._consent_callback, pattern=r"^credentials:(continue|cancel)$")],
+                OWNER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._owner_email_message)],
+                OWNER_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._owner_password_message)],
+                CHILD_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._child_email_message)],
+                CHILD_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._child_password_message)],
+                CONFIRM_RUN: [CallbackQueryHandler(self._confirm_run, pattern=r"^run:(confirm|cancel)$")],
+                ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, self._conversation_timeout)],
+            },
+            fallbacks=[CommandHandler("cancel", self._cancel_command)],
+            per_chat=True,
+            per_user=True,
+            allow_reentry=True,
+            conversation_timeout=600,
+        )
         application.add_handler(CommandHandler("start", self._start_command))
         application.add_handler(CommandHandler("help", self._help_command))
-        application.add_handler(CommandHandler("run", self._run_command))
         application.add_handler(CommandHandler("status", self._status_command))
         application.add_handler(CommandHandler("stop", self._stop_command))
-        application.add_handler(CallbackQueryHandler(self._confirmation, pattern=r"^(run:\d+|cancel)$"))
+        application.add_handler(conversation)
 
         initialized = False
         started = False
@@ -140,13 +158,28 @@ class TelegramControlBot:
         if message is not None:
             await message.reply_text("⛔ هذا البوت مخصص للمسؤول المصرّح له فقط.")
 
+    async def _delete_sensitive_message(self, message):
+        """Try to remove a credential message from the private chat immediately."""
+        try:
+            await message.delete()
+        except Exception:
+            # Never log message text or credentials, even if Telegram deletion fails.
+            pass
+
+    def _draft(self, context: ContextTypes.DEFAULT_TYPE) -> dict:
+        draft = context.user_data.get("run_draft")
+        if draft is None:
+            draft = {}
+            context.user_data["run_draft"] = draft
+        return draft
+
     async def _start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_admin(update):
             await self._deny(update)
             return
         await update.effective_message.reply_text(
             "أهلًا! بوت التحكم جاهز.\n"
-            "الأوامر: /run <عدد_الميكسات>، /status، /stop، /help"
+            "استخدم /run 50000 لبدء خطوات التشغيل، و/status للمتابعة، و/stop للإيقاف."
         )
 
     async def _help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -154,88 +187,193 @@ class TelegramControlBot:
             await self._deny(update)
             return
         await update.effective_message.reply_text(
-            "/run 50000 — يطلب تأكيدًا قبل بدء دورة اتصالات ذات عمليات فعلية.\n"
+            "/run 50000 — يطلب إدخال بيانات الحسابين عند كل تشغيل ثم تأكيد العملية.\n"
             "/status — يعرض حالة التشغيل وآخر السجل.\n"
             "/stop — يطلب إيقاف الدورة بعد انتهاء طلب الشبكة الحالي.\n"
+            "/cancel — يلغي إدخال بيانات التشغيل الحالي.\n"
             "/help — يعرض هذه المساعدة."
         )
 
     async def _run_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_admin(update):
             await self._deny(update)
-            return
-        message = update.effective_message
+            return ConversationHandler.END
+        if self._runner.is_running():
+            await update.effective_message.reply_text("يوجد تشغيل قائم بالفعل؛ أوقفه أو انتظر حتى ينتهي.")
+            return ConversationHandler.END
         if not context.args:
-            await message.reply_text(f"استخدم: /run 50000 (الحد الأقصى {MAX_TARGET_MIX:,})")
-            return
+            await update.effective_message.reply_text("استخدم الأمر مع الهدف، مثل: /run 50000")
+            return ConversationHandler.END
         try:
             target = int(context.args[0].replace(",", ""))
         except ValueError:
-            await message.reply_text("الهدف لازم يكون رقمًا صحيحًا من الميكسات.")
-            return
+            await update.effective_message.reply_text("الهدف لازم يكون رقمًا صحيحًا من الميكسات.")
+            return ConversationHandler.END
         if not 1 <= target <= MAX_TARGET_MIX:
-            await message.reply_text(f"الهدف لازم يكون بين 1 و{MAX_TARGET_MIX:,} ميكس.")
-            return
+            await update.effective_message.reply_text(f"الهدف لازم يكون بين 1 و{MAX_TARGET_MIX:,} ميكس.")
+            return ConversationHandler.END
+
+        context.user_data.pop("run_draft", None)
+        self._draft(context)["target"] = target
         keyboard = InlineKeyboardMarkup(
             [[
-                InlineKeyboardButton("✅ تأكيد التشغيل", callback_data=f"run:{target}"),
-                InlineKeyboardButton("إلغاء", callback_data="cancel"),
+                InlineKeyboardButton("أوافق وأكمل", callback_data="credentials:continue"),
+                InlineKeyboardButton("إلغاء", callback_data="credentials:cancel"),
             ]]
         )
-        await message.reply_text(
-            f"⚠️ سيبدأ تشغيلًا قد يجدد باقات ويحوّل ميكسات. الهدف: {target:,}.\nهل تؤكد؟",
+        await update.effective_message.reply_text(
+            "⚠️ قبل المتابعة: ستكتب بيانات الدخول في Telegram. سأحاول حذف رسائل البيانات فور استلامها "
+            "ولن أحفظها في Secrets أو السجل، لكن Telegram يعالج الرسائل. أكمل فقط إذا كنت موافقًا.\n\n"
+            f"الهدف: {target:,} ميكس. هل تريد المتابعة؟",
             reply_markup=keyboard,
         )
+        return CONSENT
 
-    async def _confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _consent_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         if not self._is_admin(update):
             await query.answer("غير مصرح", show_alert=True)
-            return
+            return ConversationHandler.END
         await query.answer()
-        if query.data == "cancel":
+        if query.data.endswith("cancel"):
+            context.user_data.pop("run_draft", None)
             await query.edit_message_text("تم الإلغاء.")
-            return
-        target = int(query.data.split(":", 1)[1])
-        with self._lock:
-            runner = self._runner
-            credentials = dict(self._credentials)
-        started = runner.start(
-            credentials["OWNER_EMAIL"],
-            credentials["OWNER_PASSWORD"],
-            credentials["CHILD_EMAIL"],
-            credentials["CHILD_PASSWORD"],
-            target,
+            return ConversationHandler.END
+        await query.edit_message_text("أرسل إيميل حساب الأونر في هذه المحادثة الخاصة.")
+        return OWNER_EMAIL
+
+    async def _owner_email_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            await self._deny(update)
+            return ConversationHandler.END
+        message = update.effective_message
+        email = (message.text or "").strip()
+        if "@" not in email:
+            await self._delete_sensitive_message(message)
+            await message.reply_text("الإيميل غير واضح. أرسله مرة أخرى، أو استخدم /cancel.")
+            return OWNER_EMAIL
+        self._draft(context)["owner_email"] = email
+        await self._delete_sensitive_message(message)
+        await message.reply_text("أرسل باسورد حساب الأونر. سأحاول حذف رسالة الباسورد فور استلامها.")
+        return OWNER_PASSWORD
+
+    async def _owner_password_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            await self._deny(update)
+            return ConversationHandler.END
+        message = update.effective_message
+        password = (message.text or "").strip()
+        await self._delete_sensitive_message(message)
+        if not password:
+            await message.reply_text("الباسورد فارغ. أرسله مرة أخرى، أو استخدم /cancel.")
+            return OWNER_PASSWORD
+        self._draft(context)["owner_password"] = password
+        await message.reply_text("أرسل إيميل حساب الفرد.")
+        return CHILD_EMAIL
+
+    async def _child_email_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            await self._deny(update)
+            return ConversationHandler.END
+        message = update.effective_message
+        email = (message.text or "").strip()
+        if "@" not in email:
+            await self._delete_sensitive_message(message)
+            await message.reply_text("الإيميل غير واضح. أرسله مرة أخرى، أو استخدم /cancel.")
+            return CHILD_EMAIL
+        self._draft(context)["child_email"] = email
+        await self._delete_sensitive_message(message)
+        await message.reply_text("أرسل باسورد حساب الفرد. سأحاول حذف رسالة الباسورد فور استلامها.")
+        return CHILD_PASSWORD
+
+    async def _child_password_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            await self._deny(update)
+            return ConversationHandler.END
+        message = update.effective_message
+        password = (message.text or "").strip()
+        await self._delete_sensitive_message(message)
+        if not password:
+            await message.reply_text("الباسورد فارغ. أرسله مرة أخرى، أو استخدم /cancel.")
+            return CHILD_PASSWORD
+        self._draft(context)["child_password"] = password
+        target = self._draft(context).get("target", 0)
+        keyboard = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton("✅ تأكيد وبدء التشغيل", callback_data="run:confirm"),
+                InlineKeyboardButton("إلغاء", callback_data="run:cancel"),
+            ]]
         )
+        await message.reply_text(
+            f"البيانات استُلمت مؤقتًا في الذاكرة. بدء التشغيل سيجدد/يغيّر باقات ويحوّل ميكسات.\n"
+            f"الهدف: {target:,} ميكس. هل تؤكد بدء العمليات؟",
+            reply_markup=keyboard,
+        )
+        return CONFIRM_RUN
+
+    async def _confirm_run(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        if not self._is_admin(update):
+            await query.answer("غير مصرح", show_alert=True)
+            return ConversationHandler.END
+        await query.answer()
+        if query.data.endswith("cancel"):
+            context.user_data.pop("run_draft", None)
+            await query.edit_message_text("تم الإلغاء. لم يبدأ أي تشغيل.")
+            return ConversationHandler.END
+
+        draft = context.user_data.pop("run_draft", {})
+        try:
+            started = self._runner.start(
+                draft["owner_email"],
+                draft["owner_password"],
+                draft["child_email"],
+                draft["child_password"],
+                int(draft["target"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            await query.edit_message_text("انتهت بيانات الطلب أو لم تكتمل. ابدأ من جديد باستخدام /run.")
+            return ConversationHandler.END
         if started:
-            await query.edit_message_text(f"✅ بدأ التشغيل بهدف {target:,} ميكس. استخدم /status للمتابعة و/stop للإيقاف.")
+            await query.edit_message_text("✅ بدأ التشغيل. استخدم /status للمتابعة و/stop للإيقاف.")
         else:
             await query.edit_message_text("يوجد تشغيل قائم بالفعل؛ لم أبدأ تشغيلًا آخر.")
+        return ConversationHandler.END
+
+    async def _cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            await self._deny(update)
+            return ConversationHandler.END
+        context.user_data.pop("run_draft", None)
+        await update.effective_message.reply_text("أُلغي الطلب ومُسحت بياناته المؤقتة من ذاكرة المحادثة.")
+        return ConversationHandler.END
+
+    async def _conversation_timeout(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data.pop("run_draft", None)
+        message = update.effective_message
+        if message is not None:
+            await message.reply_text("انتهت مهلة إدخال البيانات؛ مُسحت البيانات المؤقتة. ابدأ من جديد بـ /run.")
+        return ConversationHandler.END
 
     async def _status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_admin(update):
             await self._deny(update)
             return
-        with self._lock:
-            runner = self._runner
-        logs, error = runner.snapshot()
-        state = "🟢 يعمل" if runner.is_running() else "⚪ متوقف"
-        text = f"الحالة: {state}"
+        logs, error = self._runner.snapshot()
+        state = "🟢 يعمل" if self._runner.is_running() else "⚪ متوقف"
+        text = f"حالة التشغيل: {state}"
         if error:
             text += f"\nآخر خطأ: {error}"
         if logs:
-            recent = "\n".join(logs[-8:])
-            text += f"\n\nآخر السجل:\n{recent}"
+            text += "\n\nآخر السجل:\n" + "\n".join(logs[-8:])
         await update.effective_message.reply_text(text[-3800:])
 
     async def _stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_admin(update):
             await self._deny(update)
             return
-        with self._lock:
-            runner = self._runner
-        if not runner.is_running():
-            await update.effective_message.reply_text("البوت متوقف حاليًا.")
+        if not self._runner.is_running():
+            await update.effective_message.reply_text("لا يوجد تشغيل حاليًا.")
             return
-        runner.stop()
-        await update.effective_message.reply_text("⏹ وصل طلب الإيقاف؛ سيتوقف بعد انتهاء الطلب الجاري.")
+        self._runner.stop()
+        await update.effective_message.reply_text("⏹ وصل طلب الإيقاف؛ سيتوقف بعد انتهاء طلب الشبكة الحالي.")
