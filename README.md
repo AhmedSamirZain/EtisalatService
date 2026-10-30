@@ -1,6 +1,6 @@
 # Etisalat Mix Telegram Bot (hosted with Streamlit)
 
-This project runs an admin-only Telegram bot from a Streamlit-hosted process. **Only two values belong in Streamlit Secrets:** `TELEGRAM_BOT_TOKEN` and `ADMIN_ID`. Owner/child emails and passwords are entered in the private Telegram chat for each run, used only in memory, and are not saved to Secrets or Git.
+This project runs an admin-controlled Telegram bot from a Streamlit-hosted process. **Only two values belong in Streamlit Secrets:** `TELEGRAM_BOT_TOKEN` and `ADMIN_ID`. Owner/child emails and passwords are entered in the private Telegram chat for each run, used only in memory, and are not saved to Secrets or Git.
 
 The automation can renew bundles, migrate plans, and transfer mixes. These are real account operations and may incur charges. Verify the account and cost before confirming a run.
 
@@ -19,6 +19,8 @@ The automation can renew bundles, migrate plans, and transfer mixes. These are r
 Do not put account emails/passwords or the bot token in GitHub. The repository ignores `.streamlit/secrets.toml`; the example file contains placeholders only.
 
 ## Telegram buttons and commands
+
+When Telegram polling starts, the bot sends the primary admin a startup message. The admin must open the bot and send `/start` once first, because Telegram does not allow bots to initiate a private conversation. After `/start`, the admin sees the **👥 لوحة الإدارة** button along with the normal run controls. In `/admin`, the primary admin can view authorized IDs and use `/adduser 123456789`, `/removeuser 123456789`, and `/users`. An added user opens the bot and sends `/start`; their numeric ID is shown if access is not yet granted. Only the primary admin can manage the allowlist. The allowlist is stored in an ignored local SQLite file (`.streamlit/authorized_users.sqlite3`), not in Secrets or Git; if the hosting filesystem is reset during redeployment, users may need to be added again. Authorized users can run the bot with their own account credentials, but only one paid automation run can be active at a time. Only the admin and the user who started the active run can view its detailed status or stop it.
 
 After `/start`, use the persistent buttons **تشغيل**, **الحالة**, **إيقاف**, **إلغاء**, **مساعدة**, and **البداية**. The run button asks for a target, shows a safety confirmation, collects the owner/child credentials for that run, and asks for a final confirmation. Text commands are also supported: `/run 50000`, `/status`, `/stop`, `/cancel`, and `/help`. Targets are limited to 1–1,000,000 mixes.
 

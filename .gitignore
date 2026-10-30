@@ -1,6 +1,7 @@
 # Secrets must never be committed.
 .streamlit/secrets.toml
 .streamlit/secrets.toml.*
+.streamlit/authorized_users.sqlite3*
 !.streamlit/secrets.toml.example
 
 # Python artifacts
