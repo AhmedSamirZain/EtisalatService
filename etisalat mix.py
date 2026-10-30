@@ -142,7 +142,7 @@ class EtisalatAPI:
                 time.sleep(5)
         return False
 
-    def get_status_and_child(self):
+    def get_status_and_child(self, timeout=10):
         if not self.current_dial:
             return None, 0, None
         xml_body = (
@@ -157,7 +157,7 @@ class EtisalatAPI:
         h, u, _ = self._sign(url_path, "")
         headers.update({"headerSignature": h, "urlSignature": u})
         try:
-            r = self.session.get(BASE_URL + url_path, headers=headers, timeout=10)
+            r = self.session.get(BASE_URL + url_path, headers=headers, timeout=timeout)
             if r.status_code != 200:
                 return None, 0, None
             root = ET.fromstring(r.text)
@@ -284,12 +284,14 @@ class AutoLoop:
         self.stopped = True
 
     def _sleep(self, seconds):
-        """نوم قابل للإيقاف بـ Ctrl+C"""
-        for _ in range(int(seconds)):
-            if self.stopped:
-                return False
-            time.sleep(1)
-        return True
+        """نوم قابل للإيقاف مع دعم فواصل فحص أقل من ثانية."""
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while not self.stopped:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            time.sleep(min(0.1, remaining))
+        return False
 
     def run(self):
         try:
@@ -303,19 +305,36 @@ class AutoLoop:
 
     def _run(self):
         # ---- فحص نظام الأونر ----
-        log_step("فحص نظام الأونر...")
-        plan_id, _, _ = self.owner.get_status_and_child()
+        log_step("فحص النظام الحالي قبل أي عملية...")
+        initial = getattr(self, "initial_status", None)
+        if initial is None:
+            initial = self.owner.get_status_and_child(timeout=(2, 3))
+        plan_id, initial_mix, _ = initial
         if self.stopped:
             return
+        if not plan_id:
+            log_err("تعذر قراءة النظام الحالي؛ لن يبدأ التجديد أو التحويل")
+            return
+
+        current_name, _ = PLAN_IDS.get(plan_id, (plan_id, ""))
+        next_plan = (
+            "Hekaya_XRP_MIX_Parent_6"
+            if "Parent_7" in plan_id
+            else "Hekaya_XRP_MIX_Parent_7"
+        )
+        next_name, _ = PLAN_IDS.get(next_plan, (next_plan, ""))
+        log_info(f"النظام عند البداية: {current_name} ({plan_id})")
+        log_info(f"الرصيد عند البداية: {initial_mix:,} ميكس")
+        log_info(f"النظام التالي حسب الحالة الحالية: {next_name}")
 
         # ---- ترقية النظام ----
         if plan_id and "Parent_7" not in plan_id:
             log_info(f"النظام الحالي: {plan_id} → جارٍ الترقية إلى 270")
             self.owner.change_plan("Hekaya_XRP_MIX_Parent_7")
             for _ in range(30):
-                if not self._sleep(1):
+                if not self._sleep(0.25):
                     return
-                pid, _, _ = self.owner.get_status_and_child()
+                pid, _, _ = self.owner.get_status_and_child(timeout=(2, 3))
                 if pid and "Parent_7" in pid:
                     log_ok("تم الترقية بنجاح")
                     break
@@ -324,7 +343,7 @@ class AutoLoop:
             return
 
         # ---- التحقق من الفرد ----
-        _, _, child_num = self.owner.get_status_and_child()
+        _, _, child_num = self.owner.get_status_and_child(timeout=(2, 3))
         if not child_num:
             log_err("لا يوجد فرد مضاف — أضف فرداً أولاً")
             return
@@ -339,7 +358,7 @@ class AutoLoop:
             print(f"{C.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
             log(f"🔄 الدورة رقم {self.cycle_count}", C.BOLD + C.CYAN)
 
-            plan_id, mix_amount, child_num = self.owner.get_status_and_child()
+            plan_id, mix_amount, child_num = self.owner.get_status_and_child(timeout=(2, 3))
             if self.stopped:
                 return
             if not plan_id:
@@ -379,7 +398,7 @@ class AutoLoop:
                 return
 
             # ---- تحويل الميكس للفرد ----
-            _, new_mix, _ = self.owner.get_status_and_child()
+            _, new_mix, _ = self.owner.get_status_and_child(timeout=(2, 3))
             if self.stopped:
                 return
             if new_mix > 0:
@@ -394,7 +413,7 @@ class AutoLoop:
                 log_warn("لا يوجد ميكس جديد، انتظار...")
                 if not self._sleep(5):
                     return
-                _, child_mix, _ = self.child.get_status_and_child()
+                _, child_mix, _ = self.child.get_status_and_child(timeout=(2, 3))
                 if child_mix <= 0:
                     if not self._sleep(10):
                         return
@@ -423,15 +442,15 @@ class AutoLoop:
             log_info("مراقبة تغيير النظام...")
             detected = False
             for i in range(90):
-                if not self._sleep(1):
+                if not self._sleep(0.25):
                     return
-                cur_pid, _, _ = self.owner.get_status_and_child()
+                cur_pid, _, _ = self.owner.get_status_and_child(timeout=(2, 3))
                 if cur_pid and cur_pid != last_plan:
                     detected = True
                     log_ok(f"تم التغيير إلى {cur_pid}")
                     break
                 if i % 10 == 0 and i > 0:
-                    log(f"  ... انتظار ({i}s)", C.GRAY)
+                    log(f"  فحص تغيير النظام: المحاولة {i+1}/90", C.GRAY)
 
             if self.stopped:
                 return
@@ -443,7 +462,7 @@ class AutoLoop:
 
             # ---- ترحيل ميكسات الفرد ----
             log_info("ترحيل ميكسات الفرد للأونر...")
-            _, child_mix, _ = self.child.get_status_and_child()
+            _, child_mix, _ = self.child.get_status_and_child(timeout=(2, 3))
             if child_mix > 0:
                 if self.child.transfer_mix(self.owner.current_dial, child_mix,
                                            "Hekaya_XRP_MIX_Child_1"):

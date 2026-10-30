@@ -18,13 +18,11 @@ The automation can renew bundles, migrate plans, and transfer mixes. These are r
 
 Do not put account emails/passwords or the bot token in GitHub. The repository ignores `.streamlit/secrets.toml`; the example file contains placeholders only.
 
-## Telegram commands
+## Telegram buttons and commands
 
-- `/start` or `/help` — instructions.
-- `/status` — automation status and recent logs (admin only).
-- `/run 50000` — begins a private, interactive setup for a target of 50,000 mixes. The bot asks for the owner email/password and child email/password for this run, then requests a final confirmation before starting. Targets are limited to 1–1,000,000 mixes.
-- `/cancel` — clears the current setup from in-memory conversation state.
-- `/stop` — requests a stop after the current network request finishes.
+After `/start`, use the persistent buttons **تشغيل**, **الحالة**, **إيقاف**, **إلغاء**, **مساعدة**, and **البداية**. The run button asks for a target, shows a safety confirmation, collects the owner/child credentials for that run, and asks for a final confirmation. Text commands are also supported: `/run 50000`, `/status`, `/stop`, `/cancel`, and `/help`. Targets are limited to 1–1,000,000 mixes.
+
+Before any automation action, the app reads and logs the current plan and the next plan in the existing 180/270 sequence. Plan-status requests use shorter connect/read timeouts and a quarter-second pause between migration checks; if the Etisalat server itself is slow or unreachable, faster polling cannot make it respond, and the bot may report timeouts.
 
 Only private messages from the Telegram account whose numeric user ID matches `ADMIN_ID` are authorized. Do not run another polling instance with the same token.
 

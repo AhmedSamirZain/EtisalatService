@@ -96,7 +96,24 @@ class BackgroundRunner:
             if self._stop_requested:
                 return
 
+            self.add_log("قراءة النظام والرصيد قبل بدء أي تجديد أو تحويل...")
+            initial_status = owner.get_status_and_child(timeout=(2, 3))
+            plan_id, initial_mix, _ = initial_status
+            if not plan_id:
+                raise RuntimeError("تعذرت قراءة النظام الحالي؛ أوقفت التشغيل قبل أي عملية.")
+            plan_name, _ = bot.PLAN_IDS.get(plan_id, (plan_id, ""))
+            next_plan_id = (
+                "Hekaya_XRP_MIX_Parent_6"
+                if "Parent_7" in plan_id
+                else "Hekaya_XRP_MIX_Parent_7"
+            )
+            next_plan_name, _ = bot.PLAN_IDS.get(next_plan_id, (next_plan_id, ""))
+            self.add_log(f"النظام عند البداية: {plan_name}")
+            self.add_log(f"الرصيد عند البداية: {initial_mix:,} ميكس")
+            self.add_log(f"النظام التالي حسب الحالة الحالية: {next_plan_name}")
+
             loop = bot.AutoLoop(owner, child, target)
+            loop.initial_status = initial_status
             loop.owner_email = owner_email
             loop.owner_pass = owner_password
             with self._lock:

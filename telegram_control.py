@@ -6,7 +6,13 @@ import asyncio
 import threading
 from typing import Any
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -19,7 +25,14 @@ from telegram.ext import (
 
 
 MAX_TARGET_MIX = 1_000_000
-(CONSENT, OWNER_EMAIL, OWNER_PASSWORD, CHILD_EMAIL, CHILD_PASSWORD, CONFIRM_RUN) = range(6)
+(TARGET, CONSENT, OWNER_EMAIL, OWNER_PASSWORD, CHILD_EMAIL, CHILD_PASSWORD, CONFIRM_RUN) = range(7)
+
+BUTTON_RUN = "▶️ تشغيل"
+BUTTON_STATUS = "📊 الحالة"
+BUTTON_STOP = "⏹ إيقاف"
+BUTTON_CANCEL = "❌ إلغاء"
+BUTTON_HELP = "ℹ️ مساعدة"
+BUTTON_HOME = "🏠 البداية"
 
 
 class TelegramControlBot:
@@ -93,8 +106,12 @@ class TelegramControlBot:
 
         application = Application.builder().token(token).build()
         conversation = ConversationHandler(
-            entry_points=[CommandHandler("run", self._run_command)],
+            entry_points=[
+                CommandHandler("run", self._run_command),
+                MessageHandler(filters.Regex(r"^▶️ تشغيل$"), self._run_button),
+            ],
             states={
+                TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._target_message)],
                 CONSENT: [CallbackQueryHandler(self._consent_callback, pattern=r"^credentials:(continue|cancel)$")],
                 OWNER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._owner_email_message)],
                 OWNER_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._owner_password_message)],
@@ -103,7 +120,10 @@ class TelegramControlBot:
                 CONFIRM_RUN: [CallbackQueryHandler(self._confirm_run, pattern=r"^run:(confirm|cancel)$")],
                 ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, self._conversation_timeout)],
             },
-            fallbacks=[CommandHandler("cancel", self._cancel_command)],
+            fallbacks=[
+                CommandHandler("cancel", self._cancel_command),
+                MessageHandler(filters.Regex(r"^❌ إلغاء$"), self._cancel_command),
+            ],
             per_chat=True,
             per_user=True,
             allow_reentry=True,
@@ -111,9 +131,15 @@ class TelegramControlBot:
         )
         application.add_handler(CommandHandler("start", self._start_command))
         application.add_handler(CommandHandler("help", self._help_command))
+        application.add_handler(MessageHandler(filters.Regex(r"^ℹ️ مساعدة$"), self._help_command))
+        application.add_handler(MessageHandler(filters.Regex(r"^🏠 البداية$"), self._start_command))
         application.add_handler(CommandHandler("status", self._status_command))
+        application.add_handler(MessageHandler(filters.Regex(r"^📊 الحالة$"), self._status_command))
         application.add_handler(CommandHandler("stop", self._stop_command))
+        application.add_handler(MessageHandler(filters.Regex(r"^⏹ إيقاف$"), self._stop_command))
         application.add_handler(conversation)
+        application.add_handler(CommandHandler("cancel", self._cancel_command))
+        application.add_handler(MessageHandler(filters.Regex(r"^❌ إلغاء$"), self._cancel_command))
 
         initialized = False
         started = False
@@ -173,13 +199,27 @@ class TelegramControlBot:
             context.user_data["run_draft"] = draft
         return draft
 
+    @staticmethod
+    def _main_keyboard():
+        return ReplyKeyboardMarkup(
+            [
+                [KeyboardButton(BUTTON_RUN), KeyboardButton(BUTTON_STATUS)],
+                [KeyboardButton(BUTTON_STOP), KeyboardButton(BUTTON_CANCEL)],
+                [KeyboardButton(BUTTON_HELP), KeyboardButton(BUTTON_HOME)],
+            ],
+            resize_keyboard=True,
+            is_persistent=True,
+            input_field_placeholder="اختار أمر من الأزرار",
+        )
+
     async def _start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_admin(update):
             await self._deny(update)
             return
         await update.effective_message.reply_text(
-            "أهلًا! بوت التحكم جاهز.\n"
-            "استخدم /run 50000 لبدء خطوات التشغيل، و/status للمتابعة، و/stop للإيقاف."
+            "أهلًا! اختار زر من القائمة: تشغيل، الحالة، إيقاف، أو إلغاء.\n"
+            "تقدر كمان تستخدم /run 50000 أو /help.",
+            reply_markup=self._main_keyboard(),
         )
 
     async def _help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -187,32 +227,61 @@ class TelegramControlBot:
             await self._deny(update)
             return
         await update.effective_message.reply_text(
-            "/run 50000 — يطلب إدخال بيانات الحسابين عند كل تشغيل ثم تأكيد العملية.\n"
-            "/status — يعرض حالة التشغيل وآخر السجل.\n"
-            "/stop — يطلب إيقاف الدورة بعد انتهاء طلب الشبكة الحالي.\n"
-            "/cancel — يلغي إدخال بيانات التشغيل الحالي.\n"
-            "/help — يعرض هذه المساعدة."
+            "▶️ تشغيل: اكتب الهدف ثم راجع ملخص النظام قبل التأكيد.\n"
+            "📊 الحالة: يعرض آخر مرحلة والنظام والرصيد والهدف.\n"
+            "⏹ إيقاف: يوقف بعد انتهاء طلب الشبكة الحالي.\n"
+            "❌ إلغاء: يلغي إدخال بيانات التشغيل.\n"
+            "الأوامر النصية البديلة: /run 50000، /status، /stop، /cancel.",
+            reply_markup=self._main_keyboard(),
         )
+
+    async def _run_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            await self._deny(update)
+            return ConversationHandler.END
+        if self._runner.is_running():
+            await update.effective_message.reply_text("فيه تشغيل قائم بالفعل. اختار الحالة أو أوقفه قبل تشغيل جديد.")
+            return ConversationHandler.END
+        context.user_data.pop("run_draft", None)
+        await update.effective_message.reply_text(
+            f"اكتب هدف الميكسات (من 1 إلى {MAX_TARGET_MIX:,})، أو اضغط إلغاء.",
+            reply_markup=self._main_keyboard(),
+        )
+        return TARGET
 
     async def _run_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_admin(update):
             await self._deny(update)
             return ConversationHandler.END
         if self._runner.is_running():
-            await update.effective_message.reply_text("يوجد تشغيل قائم بالفعل؛ أوقفه أو انتظر حتى ينتهي.")
+            await update.effective_message.reply_text("فيه تشغيل قائم بالفعل. اختار الحالة أو أوقفه قبل تشغيل جديد.")
             return ConversationHandler.END
         if not context.args:
-            await update.effective_message.reply_text("استخدم الأمر مع الهدف، مثل: /run 50000")
-            return ConversationHandler.END
+            context.user_data.pop("run_draft", None)
+            await update.effective_message.reply_text("اكتب هدف الميكسات، مثال: 500000.")
+            return TARGET
         try:
             target = int(context.args[0].replace(",", ""))
         except ValueError:
             await update.effective_message.reply_text("الهدف لازم يكون رقمًا صحيحًا من الميكسات.")
             return ConversationHandler.END
+        return await self._request_run_consent(update, context, target)
+
+    async def _target_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            await self._deny(update)
+            return ConversationHandler.END
+        try:
+            target = int((update.effective_message.text or "").replace(",", "").strip())
+        except ValueError:
+            await update.effective_message.reply_text("اكتب هدفًا رقميًا واضحًا، أو اضغط إلغاء.")
+            return TARGET
+        return await self._request_run_consent(update, context, target)
+
+    async def _request_run_consent(self, update: Update, context: ContextTypes.DEFAULT_TYPE, target: int):
         if not 1 <= target <= MAX_TARGET_MIX:
             await update.effective_message.reply_text(f"الهدف لازم يكون بين 1 و{MAX_TARGET_MIX:,} ميكس.")
             return ConversationHandler.END
-
         context.user_data.pop("run_draft", None)
         self._draft(context)["target"] = target
         keyboard = InlineKeyboardMarkup(
@@ -222,9 +291,9 @@ class TelegramControlBot:
             ]]
         )
         await update.effective_message.reply_text(
-            "⚠️ قبل المتابعة: ستكتب بيانات الدخول في Telegram. سأحاول حذف رسائل البيانات فور استلامها "
-            "ولن أحفظها في Secrets أو السجل، لكن Telegram يعالج الرسائل. أكمل فقط إذا كنت موافقًا.\n\n"
-            f"الهدف: {target:,} ميكس. هل تريد المتابعة؟",
+            f"الهدف: {target:,} ميكس.\n"
+            "بعد إدخال بيانات الحسابين، سأقرأ النظام الحالي قبل بدء العمليات وأعرضه في الحالة.\n\n"
+            "⚠️ ستدخل بيانات الحسابين في Telegram؛ سأحاول حذف رسائلها بعد الاستلام. أكمل فقط إذا كنت موافقًا.",
             reply_markup=keyboard,
         )
         return CONSENT
