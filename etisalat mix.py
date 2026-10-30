@@ -308,7 +308,14 @@ class EtisalatAPI:
 # ============================================================
 
 class AutoLoop:
-    def __init__(self, owner: EtisalatAPI, child: EtisalatAPI, target_mix: int):
+    def __init__(
+        self,
+        owner: EtisalatAPI,
+        child: EtisalatAPI,
+        target_mix: int,
+        retry_settings_provider=None,
+        status_callback=None,
+    ):
         self.owner = owner
         self.child = child
         self.target_mix = target_mix
@@ -319,10 +326,31 @@ class AutoLoop:
         self._stop_child_transfer_attempted = False
         self._stop_child_transfer_accepted = False
         self._stop_child_transfer_amount = 0
+        self._retry_settings_provider = retry_settings_provider
+        self._status_callback = status_callback
+        self._live_state = {"phase": "starting", "status": "بدء التشغيل", "target_mix": target_mix}
+
+    def _set_live_state(self, **updates):
+        self._live_state.update(updates)
+        if self._status_callback is not None:
+            try:
+                self._status_callback(dict(self._live_state))
+            except Exception:
+                pass
+
+    def _retry_settings(self):
+        try:
+            settings = self._retry_settings_provider() if self._retry_settings_provider else {}
+        except Exception:
+            settings = {}
+        interval = max(60, int(settings.get("plan_retry_seconds", 240)))
+        retry_limit = max(0, int(settings.get("plan_retry_limit", 3)))
+        return interval, retry_limit
 
     def stop(self):
         """Request a safe stop; final child-to-owner cleanup runs before exit."""
         self.stop_requested = True
+        self._set_live_state(phase="stopping", status="وصل طلب الإيقاف؛ جارٍ إنهاء الطلب الحالي")
 
     def _sleep(self, seconds):
         """Interruptible sleep used between operations and during retry backoff."""
@@ -365,32 +393,124 @@ class AutoLoop:
                 return None
         return None
 
-    def _wait_for_plan(self, expected_plan_id):
-        """Poll rapidly first, then keep checking until exact confirmation or manual stop."""
-        attempt = 0
+    def _wait_for_plan(self, expected_plan_id, previous_plan_id=None, target_pid=""):
+        """Wait for exact plan confirmation; retry only after a readable old-plan response."""
+        interval_seconds, retry_limit = self._retry_settings()
+        request_started = time.monotonic()
+        readable_checks = 0
+        limit_notice_sent = False
+        last_unexpected_plan = None
+        self._set_live_state(
+            phase="plan_confirmation",
+            status="بانتظار تأكيد النظام المطلوب",
+            current_plan_id=previous_plan_id,
+            target_plan_id=expected_plan_id,
+            retries_done=0,
+            retry_limit=retry_limit,
+            retry_interval_seconds=interval_seconds,
+            request_started=request_started,
+            last_status_read=None,
+        )
         while not self.stopped and not self.stop_requested:
-            if attempt < 10:
-                pause, mode = 0.25, "سريع"
-            elif attempt < 20:
-                pause, mode = 0.75, "متوسط"
-            else:
-                pause, mode = 2.0, "مستمر"
-
-            if not self._sleep(pause):
+            if not self._sleep(3):
                 return False
             status = self._read_status(self.owner, f"تأكيد النظام {expected_plan_id}")
             if status is None or self.stopped or self.stop_requested:
                 return False
+
             current_plan = status[0]
+            now = time.monotonic()
+            readable_checks += 1
+            interval_seconds, retry_limit = self._retry_settings()
+            retries_done = self._live_state.get("retries_done", 0)
+            self._set_live_state(
+                current_plan_id=current_plan,
+                last_status_read=now,
+                retry_limit=retry_limit,
+                retry_interval_seconds=interval_seconds,
+            )
             if current_plan == expected_plan_id:
+                self._set_live_state(
+                    phase="plan_confirmed",
+                    status="تم تأكيد النظام المطلوب",
+                    current_plan_id=current_plan,
+                    target_plan_id=expected_plan_id,
+                    retries_done=retries_done,
+                )
                 log_ok(f"تم تأكيد النظام المطلوب بالضبط: {current_plan}")
                 return True
 
-            attempt += 1
-            if attempt == 1 or attempt % 5 == 0:
+            if current_plan == previous_plan_id:
+                elapsed = now - request_started
+                if elapsed >= interval_seconds:
+                    if retry_limit and retries_done >= retry_limit:
+                        self._set_live_state(
+                            phase="plan_retry_limit",
+                            status="لم يتأكد تغيير النظام؛ اكتمل حد الإعادات وسأواصل المراقبة",
+                        )
+                        if not limit_notice_sent:
+                            log_warn(
+                                f"ما زال النظام {previous_plan_id} بعد {interval_seconds // 60} دقيقة، "
+                                f"ووصلت لحد الإعادات ({retry_limit})؛ سأواصل المراقبة دون طلب إضافي."
+                            )
+                            limit_notice_sent = True
+                    else:
+                        if self.stop_requested:
+                            return False
+                        retry_number = retries_done + 1
+                        self._set_live_state(
+                            phase="plan_retrying",
+                            status=f"النظام ما زال قديمًا؛ إعادة طلب التغيير ({retry_number})",
+                            retry_number=retry_number,
+                        )
+                        limit_label = "بلا حد" if retry_limit == 0 else str(retry_limit)
+                        log_warn(
+                            f"قراءة ناجحة أكدت أن النظام ما زال {previous_plan_id} بعد "
+                            f"{interval_seconds // 60} دقيقة؛ إعادة طلب تغيير النظام "
+                            f"إلى {expected_plan_id} ({retry_number} من {limit_label})."
+                        )
+                        accepted = self.owner.change_plan(expected_plan_id, target_pid)
+                        request_started = time.monotonic()
+                        retries_done = retry_number
+                        self._set_live_state(
+                            phase="plan_confirmation",
+                            status=(
+                                "اتصالات قبلت طلب إعادة التغيير؛ بانتظار تأكيد النظام"
+                                if accepted
+                                else "رد إعادة طلب التغيير غير مؤكد؛ أتحقق قبل أي إعادة أخرى"
+                            ),
+                            retries_done=retries_done,
+                            retry_number=None,
+                            request_started=request_started,
+                            current_plan_id=current_plan,
+                        )
+                        if accepted:
+                            log_info("اتصالات قبلت طلب إعادة تغيير النظام؛ سأنتظر التأكيد قبل أي خطوة أخرى.")
+                        else:
+                            log_warn("رد إعادة تغيير النظام غير مؤكد؛ لن أكرر الطلب حتى يحين الفاصل وتؤكد قراءة ناجحة بقاء النظام القديم.")
+                        limit_notice_sent = False
+                else:
+                    self._set_live_state(
+                        phase="plan_confirmation",
+                        status="النظام الحالي ما زال القديم؛ أنتظر مهلة إعادة الطلب",
+                    )
+            else:
+                self._set_live_state(
+                    phase="plan_confirmation",
+                    status="قراءة الحالة نجحت لكن النظام غير متوقع؛ أواصل التحقق دون إعادة الطلب",
+                )
+                if current_plan != last_unexpected_plan:
+                    log_warn(
+                        f"قراءة النظام الحالية ({current_plan}) لا تطابق النظام المطلوب "
+                        f"({expected_plan_id}) أو السابق ({previous_plan_id})؛ لن أعيد الطلب على حالة غير مؤكدة."
+                    )
+                    last_unexpected_plan = current_plan
+
+            if readable_checks == 1 or readable_checks % 10 == 0:
+                mode = "بلا حد" if retry_limit == 0 else str(retry_limit)
                 log_info(
-                    f"لسه بأكد النظام المطلوب {expected_plan_id}؛ المحاولة {attempt} ({mode}). "
-                    "مش هبدأ العملية التالية قبل التأكيد."
+                    f"ما زلت أتحقق من {expected_plan_id}؛ النظام المقروء {current_plan}، "
+                    f"الإعادات {retries_done}/{mode}."
                 )
         return False
 
@@ -501,6 +621,13 @@ class AutoLoop:
         log_info(f"النظام عند البداية: {current_name} ({plan_id})")
         log_info(f"الرصيد عند البداية: {initial_mix:,} ميكس")
         log_info(f"النظام التالي حسب الحالة الحالية: {next_name}")
+        self._set_live_state(
+            phase="preparing",
+            status="تجهيز الدورة بعد قراءة النظام الحالي",
+            current_plan_id=plan_id,
+            target_mix=self.target_mix,
+            current_mix=initial_mix,
+        )
 
         # ---- ترقية النظام ----
         if plan_id not in PLAN_IDS:
@@ -510,10 +637,19 @@ class AutoLoop:
             if self.stop_requested:
                 return
             target_plan = "Hekaya_XRP_MIX_Parent_7"
+            self._set_live_state(
+                phase="plan_change_request",
+                status="إرسال طلب الترقية إلى 270",
+                current_plan_id=plan_id,
+                target_plan_id=target_plan,
+            )
             log_info(f"النظام الحالي: {plan_id} → جارٍ الترقية إلى 270")
-            if not self.owner.change_plan(target_plan):
-                log_warn("رد طلب الترقية غير مؤكد؛ سأفحص النظام دون إعادة إرسال الطلب")
-            if not self._wait_for_plan(target_plan):
+            accepted = self.owner.change_plan(target_plan)
+            if accepted:
+                log_info("اتصالات قبلت طلب الترقية؛ أنتظر تأكيد ظهور النظام المطلوب.")
+            else:
+                log_warn("رد طلب الترقية غير مؤكد؛ سأتحقق من النظام، وأعيد الطلب فقط بعد المهلة إذا أكدت قراءة ناجحة بقاء الخطة القديمة")
+            if not self._wait_for_plan(target_plan, previous_plan_id=plan_id, target_pid=""):
                 return
 
         if self.stopped or self.stop_requested:
@@ -541,6 +677,14 @@ class AutoLoop:
             if status is None or self.stopped or self.stop_requested:
                 return
             plan_id, mix_amount, child_num = status
+            self._set_live_state(
+                phase="cycle_status",
+                status=f"فحص الدورة رقم {self.cycle_count}",
+                current_plan_id=plan_id,
+                current_mix=mix_amount,
+                target_mix=self.target_mix,
+                cycle_count=self.cycle_count,
+            )
             if child_num:
                 self.child_num = child_num
             else:
@@ -577,6 +721,13 @@ class AutoLoop:
             # ---- تجديد الباقة ----
             if self.stop_requested:
                 return
+            self._set_live_state(
+                phase="renewing",
+                status=f"تجديد الباقة {name}",
+                current_plan_id=plan_id,
+                current_mix=mix_amount,
+                cycle_count=self.cycle_count,
+            )
             log_info(f"تجديد الباقة ({name})...")
             if not self.owner.renew_bundle_action(plan_id, price):
                 log_warn("فشل التجديد")
@@ -591,6 +742,13 @@ class AutoLoop:
             if new_mix > 0:
                 if self.stop_requested:
                     return
+                self._set_live_state(
+                    phase="transfer_to_child",
+                    status=f"تحويل {new_mix:,} ميكس للفرد",
+                    current_plan_id=plan_id,
+                    current_mix=mix_amount,
+                    cycle_count=self.cycle_count,
+                )
                 log_info(f"تحويل {new_mix:,} ميكس للفرد {child_num}...")
                 if not self.owner.transfer_mix(child_num, new_mix, plan_id):
                     log_warn("فشل التحويل، انتظار 10 ثواني...")
@@ -599,6 +757,13 @@ class AutoLoop:
                     continue
                 log_ok("تم التحويل")
             else:
+                self._set_live_state(
+                    phase="waiting_for_mix",
+                    status="لا يوجد ميكس جديد؛ أنتظر تحديث الرصيد",
+                    current_plan_id=plan_id,
+                    current_mix=mix_amount,
+                    cycle_count=self.cycle_count,
+                )
                 log_warn("لا يوجد ميكس جديد، انتظار...")
                 if not self._sleep(5):
                     return
@@ -627,16 +792,37 @@ class AutoLoop:
 
             if self.stop_requested:
                 return
+            self._set_live_state(
+                phase="plan_change_request",
+                status="إرسال طلب تغيير النظام",
+                current_plan_id=plan_id,
+                target_plan_id=target_plan,
+                target_mix=self.target_mix,
+                retries_done=0,
+                retry_limit=self._retry_settings()[1],
+                retry_interval_seconds=self._retry_settings()[0],
+            )
             log_info(f"تغيير النظام إلى {target_plan}...")
-            if not self.owner.change_plan(target_plan, target_pid):
-                log_warn("رد تغيير النظام غير مؤكد؛ سأفحص الحالة دون إعادة إرسال الطلب")
+            accepted = self.owner.change_plan(target_plan, target_pid)
+            if accepted:
+                log_info("اتصالات قبلت طلب تغيير النظام؛ أنتظر التأكيد قبل أي خطوة أخرى.")
+            else:
+                log_warn("رد تغيير النظام غير مؤكد؛ سأتحقق من الحالة وأعيد الطلب فقط بعد المهلة وقراءة مؤكدة للخطة القديمة")
 
             # لا نكمل النقل أو الدورة التالية إلا بعد ظهور المعرّف المطلوب بالضبط.
             log_info(f"فحص سريع لتأكيد الوصول إلى {target_plan}...")
-            if not self._wait_for_plan(target_plan):
+            if not self._wait_for_plan(
+                target_plan, previous_plan_id=plan_id, target_pid=target_pid
+            ):
                 return
 
             # ---- ترحيل ميكسات الفرد ----
+            self._set_live_state(
+                phase="child_balance_transfer",
+                status="قراءة رصيد الفرد وترحيله للأونر",
+                current_plan_id=target_plan,
+                cycle_count=self.cycle_count,
+            )
             log_info("ترحيل ميكسات الفرد للأونر...")
             status = self._read_status(self.child, "رصيد الفرد بعد تغيير النظام")
             if status is None or self.stopped or self.stop_requested:

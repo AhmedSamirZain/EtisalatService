@@ -6,6 +6,8 @@ import asyncio
 import sqlite3
 import tempfile
 import threading
+import time
+from datetime import datetime
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,15 @@ BUTTON_HELP = "ℹ️ مساعدة"
 BUTTON_HOME = "🏠 البداية"
 BUTTON_ADMIN = "👥 لوحة الإدارة"
 
+DEFAULT_BOT_SETTINGS = {
+    "plan_retry_minutes": 4,
+    "plan_retry_limit": 3,
+    "status_refresh_seconds": 5,
+}
+PLAN_RETRY_MINUTE_OPTIONS = (1, 2, 3, 4, 5, 10, 15)
+PLAN_RETRY_LIMIT_OPTIONS = (1, 3, 5, 10, 0)  # 0 means unlimited retries.
+STATUS_REFRESH_OPTIONS = (3, 5, 10, 15)
+
 
 class TelegramControlBot:
     """Run Telegram long polling and collect per-run credentials in memory only."""
@@ -53,6 +64,8 @@ class TelegramControlBot:
         self._runner: Any = None
         self._error: str | None = None
         self._active_user_id: int | None = None
+        self._live_status_target: dict[str, int] | None = None
+        self._live_status_job = None
         self._users_db = Path(__file__).resolve().parent / ".streamlit" / "authorized_users.sqlite3"
         try:
             self._init_users_db()
@@ -68,7 +81,10 @@ class TelegramControlBot:
             self._token = token
             self._admin_id = admin_id
             self._runner = runner
-            runner.set_completion_callback(self._activation_completed)
+            if hasattr(runner, "set_completion_callback"):
+                runner.set_completion_callback(self._activation_completed)
+            if hasattr(runner, "set_plan_retry_settings_provider"):
+                runner.set_plan_retry_settings_provider(self._plan_retry_settings)
 
     def _init_users_db(self):
         self._users_db.parent.mkdir(parents=True, exist_ok=True)
@@ -91,6 +107,14 @@ class TelegramControlBot:
                 "finished_at TEXT)"
             )
             db.execute(
+                "CREATE TABLE IF NOT EXISTS bot_settings ("
+                "setting_key TEXT PRIMARY KEY, setting_value INTEGER NOT NULL)"
+            )
+            db.executemany(
+                "INSERT OR IGNORE INTO bot_settings(setting_key, setting_value) VALUES (?, ?)",
+                DEFAULT_BOT_SETTINGS.items(),
+            )
+            db.execute(
                 "INSERT OR IGNORE INTO user_quotas(user_id) SELECT user_id FROM authorized_users"
             )
             db.execute(
@@ -104,6 +128,35 @@ class TelegramControlBot:
                 "UPDATE activations SET status = 'stopped', finished_at = CURRENT_TIMESTAMP "
                 "WHERE status = 'running'"
             )
+
+    def _bot_settings(self) -> dict[str, int]:
+        with self._lock, closing(sqlite3.connect(self._users_db)) as db, db:
+            rows = db.execute("SELECT setting_key, setting_value FROM bot_settings").fetchall()
+        settings = dict(DEFAULT_BOT_SETTINGS)
+        settings.update({str(key): int(value) for key, value in rows})
+        return settings
+
+    def _plan_retry_settings(self) -> dict[str, int]:
+        settings = self._bot_settings()
+        return {
+            "plan_retry_seconds": settings["plan_retry_minutes"] * 60,
+            "plan_retry_limit": settings["plan_retry_limit"],
+        }
+
+    def _set_bot_setting(self, key: str, value: int) -> bool:
+        allowed = {
+            "plan_retry_minutes": PLAN_RETRY_MINUTE_OPTIONS,
+            "plan_retry_limit": PLAN_RETRY_LIMIT_OPTIONS,
+            "status_refresh_seconds": STATUS_REFRESH_OPTIONS,
+        }
+        if key not in allowed or value not in allowed[key]:
+            return False
+        with self._lock, closing(sqlite3.connect(self._users_db)) as db, db:
+            cursor = db.execute(
+                "UPDATE bot_settings SET setting_value = ? WHERE setting_key = ?",
+                (value, key),
+            )
+            return cursor.rowcount == 1
 
     def _authorized_user_ids(self) -> list[int]:
         with self._lock, closing(sqlite3.connect(self._users_db)) as db, db:
@@ -279,8 +332,10 @@ class TelegramControlBot:
         application.add_handler(CommandHandler("grant", self._grant_command))
         application.add_handler(CommandHandler("users", self._users_command))
         application.add_handler(CommandHandler("userstats", self._userstats_command))
+        application.add_handler(CommandHandler("settings", self._settings_command))
         application.add_handler(MessageHandler(filters.Regex(r"^👥 لوحة الإدارة$"), self._admin_panel))
-        application.add_handler(CallbackQueryHandler(self._admin_callback, pattern=r"^admin:(users|add_help|remove_help|grant_help)$"))
+        application.add_handler(CallbackQueryHandler(self._admin_callback, pattern=r"^admin:(users|add_help|remove_help|grant_help|settings)$"))
+        application.add_handler(CallbackQueryHandler(self._settings_callback, pattern=r"^settings:(plan_retry_minutes|plan_retry_limit|status_refresh_seconds|noop):\d+$"))
         application.add_handler(CommandHandler("start", self._start_command))
         application.add_handler(CommandHandler("help", self._help_command))
         application.add_handler(MessageHandler(filters.Regex(r"^ℹ️ مساعدة$"), self._help_command))
@@ -397,7 +452,7 @@ class TelegramControlBot:
         is_admin = self._is_admin(update)
         text = "✅ البوت شغال ويستقبل الأوامر.\nأهلًا! اختار زر من القائمة: تشغيل، الحالة، إيقاف، أو إلغاء.\nتقدر تستخدم /run 50000 أو /help."
         if is_admin:
-            text += "\nلوحة إدارة المستخدمين: /admin."
+            text += "\nلوحة الإدارة والإعدادات: /admin و/settings."
         else:
             stats = self._quota_info(update.effective_user.id) or {"remaining": 0}
             text += f"\nالتفعيلات المتبقية: {stats['remaining']}."
@@ -418,7 +473,7 @@ class TelegramControlBot:
             "الأوامر: /run 50000، /status، /stop، /cancel."
         )
         if self._is_admin(update):
-            text += "\n👥 إدارة المستخدمين: /admin."
+            text += "\n👥 إدارة المستخدمين والإعدادات: /admin و/settings."
         await update.effective_message.reply_text(
             text,
             reply_markup=self._main_keyboard(is_admin=self._is_admin(update)),
@@ -433,7 +488,90 @@ class TelegramControlBot:
                 InlineKeyboardButton("➖ طريقة الحذف", callback_data="admin:remove_help"),
             ],
             [InlineKeyboardButton("🎟 منح تفعيلات", callback_data="admin:grant_help")],
+            [InlineKeyboardButton("⚙️ إعدادات التغيير والحالة", callback_data="admin:settings")],
         ])
+
+    @staticmethod
+    def _settings_keyboard(settings):
+        def button(label, key, value, selected):
+            return InlineKeyboardButton(
+                ("✅ " if selected else "") + label,
+                callback_data=f"settings:{key}:{value}",
+            )
+
+        retry_rows = [
+            [button(f"{minutes} د", "plan_retry_minutes", minutes, settings["plan_retry_minutes"] == minutes)
+             for minutes in (1, 2, 3, 4)],
+            [button(f"{minutes} د", "plan_retry_minutes", minutes, settings["plan_retry_minutes"] == minutes)
+             for minutes in (5, 10, 15)],
+        ]
+        limit_rows = [[
+            button("1", "plan_retry_limit", 1, settings["plan_retry_limit"] == 1),
+            button("3", "plan_retry_limit", 3, settings["plan_retry_limit"] == 3),
+            button("5", "plan_retry_limit", 5, settings["plan_retry_limit"] == 5),
+            button("10", "plan_retry_limit", 10, settings["plan_retry_limit"] == 10),
+            button("بلا حد", "plan_retry_limit", 0, settings["plan_retry_limit"] == 0),
+        ]]
+        refresh_rows = [[
+            button(f"{seconds} ث", "status_refresh_seconds", seconds, settings["status_refresh_seconds"] == seconds)
+            for seconds in STATUS_REFRESH_OPTIONS
+        ]]
+        return InlineKeyboardMarkup(
+            retry_rows
+            + [[InlineKeyboardButton("— حد الإعادات التلقائية —", callback_data="settings:noop:0")]]
+            + limit_rows
+            + [[InlineKeyboardButton("— تحديث رسالة الحالة —", callback_data="settings:noop:0")]]
+            + refresh_rows
+        )
+
+    @staticmethod
+    def _settings_text(settings):
+        limit = "بلا حد" if settings["plan_retry_limit"] == 0 else str(settings["plan_retry_limit"])
+        return (
+            "⚙️ إعدادات التشغيل التلقائي\n\n"
+            f"⏱ مهلة إعادة طلب تغيير النظام: كل {settings['plan_retry_minutes']} دقائق.\n"
+            f"🔁 أقصى إعادات تلقائية بعد الطلب الأول: {limit}.\n"
+            f"📲 تحديث رسالة الحالة: كل {settings['status_refresh_seconds']} ثوانٍ.\n\n"
+            "التغيير يُطبّق أثناء التشغيل عند دورة الفحص التالية. لن يعيد البوت طلب تغيير النظام إلا "
+            "بعد قراءة ناجحة تؤكد أن النظام القديم ما زال قائمًا. إذا تعذرت القراءة، يواصل الانتظار دون إعادة عمياء. "
+            "إعادة الطلب عملية فعلية؛ اختر حد الإعادات بحذر. عند بلوغ الحد يستمر التحقق دون طلبات إضافية."
+        )
+
+    async def _settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            await self._deny(update)
+            return
+        settings = self._bot_settings()
+        await update.effective_message.reply_text(
+            self._settings_text(settings), reply_markup=self._settings_keyboard(settings)
+        )
+
+    async def _settings_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        if not self._is_admin(update):
+            await query.answer("الإعدادات للمسؤول الرئيسي فقط.", show_alert=True)
+            return
+        parts = (query.data or "").split(":")
+        if len(parts) != 3:
+            await query.answer("إعداد غير صالح.", show_alert=True)
+            return
+        key, raw_value = parts[1], parts[2]
+        try:
+            value = int(raw_value)
+        except ValueError:
+            await query.answer("قيمة غير صالحة.", show_alert=True)
+            return
+        if key == "noop":
+            await query.answer()
+            return
+        if not self._set_bot_setting(key, value):
+            await query.answer("القيمة غير مدعومة.", show_alert=True)
+            return
+        await query.answer("تم تحديث الإعداد وسيُطبّق أثناء التشغيل.")
+        settings = self._bot_settings()
+        await query.edit_message_text(
+            self._settings_text(settings), reply_markup=self._settings_keyboard(settings)
+        )
 
     async def _admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_admin(update):
@@ -444,6 +582,7 @@ class TelegramControlBot:
             "إضافة: /adduser ثم رقم Telegram ID.\n"
             "منح تفعيلات: /grant ثم ID ثم العدد.\n"
             "عرض القائمة والتقارير: /users أو /userstats ثم ID.\n"
+            "إعداد مهلة إعادة تغيير النظام وحدّ الإعادات وتحديث الحالة: /settings.\n"
             "حذف: /removeuser ثم رقم Telegram ID.\n\n"
             "التفعيل يُخصم عند بدء التشغيل المؤكد؛ وتُسجّل المحاولات والنجاحات والإخفاقات والإيقافات.\n"
             "كل مستخدم يشغّل ببياناته بنفسه، وتشغيل واحد فقط مسموح في نفس الوقت.",
@@ -484,6 +623,11 @@ class TelegramControlBot:
                 "لمنح تفعيلات لمستخدم مضاف أرسل: /grant 123456789 10.\n"
                 "يُخصم تفعيل واحد عند تأكيد بدء التشغيل، وتُسجل النتيجة عند انتهاء المحاولة.",
                 reply_markup=self._admin_keyboard(),
+            )
+        elif query.data == "admin:settings":
+            settings = self._bot_settings()
+            await query.edit_message_text(
+                self._settings_text(settings), reply_markup=self._settings_keyboard(settings)
             )
         else:
             await query.edit_message_text(
@@ -809,7 +953,11 @@ class TelegramControlBot:
                 if activation_id is not None and remaining is not None
                 else ""
             )
-            await query.edit_message_text("✅ بدأ التشغيل." + suffix + " استخدم /status للمتابعة و/stop للإيقاف.")
+            live_message = await query.edit_message_text(
+                "✅ بدأ التشغيل." + suffix + "\nستتحدث رسالة الحالة تلقائيًا. استخدم /stop للإيقاف."
+            )
+            status_message = live_message if getattr(live_message, "message_id", None) else query.message
+            self._start_live_status_updates(context, status_message, user_id)
         else:
             if activation_id is not None:
                 self._refund_activation(activation_id)
@@ -831,6 +979,155 @@ class TelegramControlBot:
             await message.reply_text("انتهت مهلة إدخال البيانات؛ مُسحت البيانات المؤقتة. ابدأ من جديد بـ /run.")
         return ConversationHandler.END
 
+    @staticmethod
+    def _plan_label(plan_id):
+        return {
+            "Hekaya_XRP_MIX_Parent_7": "حكاية ميكسات 270",
+            "Hekaya_XRP_MIX_Parent_6": "حكاية ميكسات 180",
+            "Hekaya_XRP_MIX_Parent_5": "حكاية ميكسات 240",
+            "Hekaya_XRP_MIX_Parent_8": "حكاية ميكسات 52",
+        }.get(plan_id, plan_id or "غير متاح")
+
+    def _live_status_text(self):
+        logs, error = self._runner.snapshot()
+        state = self._runner.live_state() if hasattr(self._runner, "live_state") else {}
+        running = self._runner.is_running()
+        if running:
+            text = "🟢 التشغيل يعمل"
+        else:
+            text = "✅ اكتمل التشغيل" if state.get("outcome") == "success" else "⚪ انتهى التشغيل"
+        if state.get("status"):
+            text += f"\n📍 المرحلة: {state['status']}"
+        current = state.get("current_plan_id")
+        target = state.get("target_plan_id")
+        if current or target:
+            text += f"\n📦 النظام الحالي: {self._plan_label(current)}"
+        if state.get("current_mix") is not None:
+            text += f"\n📊 الرصيد: {state['current_mix']:,} / {state.get('target_mix', 0):,} ميكس"
+        if state.get("cycle_count") is not None:
+            text += f"\n🔄 الدورة: {state['cycle_count']}"
+        if target:
+            text += f"\n🎯 النظام المطلوب: {self._plan_label(target)}"
+            interval = max(1, int(state.get("retry_interval_seconds", 240)))
+            started = state.get("request_started")
+            retries = int(state.get("retries_done", 0))
+            limit = int(state.get("retry_limit", 3))
+            limit_label = "بلا حد" if limit == 0 else str(limit)
+            text += f"\n🔁 إعادات طلب النظام: {retries}/{limit_label}"
+            if limit and retries >= limit:
+                text += "\n⏳ تم بلوغ حد الإعادات؛ سأواصل المراقبة دون طلبات أخرى."
+            elif started is not None:
+                remaining = max(0, int(interval - (time.monotonic() - started)))
+                text += f"\n⏱ مهلة إعادة الطلب: {remaining // 60:02d}:{remaining % 60:02d}"
+                text += "\nℹ️ الإعادة لا تتم إلا بعد قراءة ناجحة تؤكد بقاء النظام القديم."
+                if state.get("last_status_read") is None:
+                    text += "\nℹ️ بانتظار أول قراءة حالة مؤكدة."
+        text += f"\n🕒 آخر تحديث: {datetime.now().strftime('%H:%M:%S')}"
+        if error:
+            text += f"\n⚠️ آخر خطأ: {error}"
+        if logs:
+            text += "\n\nآخر التحديثات:\n" + "\n".join(logs[-4:])
+        return text[-3800:]
+
+    def _start_live_status_updates(self, context, message, user_id):
+        job_queue = getattr(context.application, "job_queue", None)
+        if job_queue is None or message is None:
+            return
+        chat_id = getattr(message, "chat_id", None)
+        if chat_id is None and getattr(message, "chat", None) is not None:
+            chat_id = message.chat.id
+        message_id = getattr(message, "message_id", None)
+        if chat_id is None or message_id is None:
+            return
+        with self._lock:
+            if self._live_status_job is not None:
+                self._live_status_job.schedule_removal()
+            self._live_status_target = {
+                "chat_id": int(chat_id),
+                "message_id": int(message_id),
+                "user_id": int(user_id),
+            }
+            self._live_status_job = job_queue.run_repeating(
+                self._update_live_status,
+                interval=1.0,
+                first=0.0,
+                data={
+                    "chat_id": int(chat_id),
+                    "message_id": int(message_id),
+                    "user_id": int(user_id),
+                    "last_edit_at": 0.0,
+                    "last_text": None,
+                    "final_pending": False,
+                },
+                name=f"live-status-{user_id}",
+            )
+
+    async def _update_live_status(self, context: ContextTypes.DEFAULT_TYPE):
+        job = context.job
+        data = job.data
+        settings = self._bot_settings()
+        now = time.monotonic()
+        running = self._runner.is_running()
+        if (
+            now - data["last_edit_at"] < settings["status_refresh_seconds"]
+            and (running or data.get("final_pending", False))
+        ):
+            return
+        text = self._live_status_text()
+        if text == data["last_text"]:
+            data["last_edit_at"] = now
+            if not running:
+                job.schedule_removal()
+                with self._lock:
+                    self._live_status_job = None
+                    self._live_status_target = None
+            return
+
+        delivered = False
+        try:
+            await context.bot.edit_message_text(
+                chat_id=data["chat_id"],
+                message_id=data["message_id"],
+                text=text,
+            )
+            delivered = True
+            data["last_text"] = text
+        except Exception as exc:
+            error = str(exc).lower()
+            if "message is not modified" in error:
+                delivered = True
+                data["last_text"] = text
+            elif "message to edit not found" in error or "message can't be edited" in error:
+                try:
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=data["chat_id"], message_id=data["message_id"]
+                        )
+                    except Exception:
+                        pass
+                    replacement = await context.bot.send_message(
+                        chat_id=data["chat_id"], text=text
+                    )
+                    data["message_id"] = replacement.message_id
+                    data["last_text"] = text
+                    delivered = True
+                    with self._lock:
+                        if self._live_status_target is not None:
+                            self._live_status_target["message_id"] = replacement.message_id
+                except Exception as send_error:
+                    self._runner.add_log(f"تعذر إرسال تحديث الحالة: {send_error}")
+            else:
+                self._runner.add_log(f"تعذر تحديث رسالة الحالة مؤقتًا: {exc}")
+        data["last_edit_at"] = now
+        if not running and delivered:
+            data["final_pending"] = False
+            job.schedule_removal()
+            with self._lock:
+                self._live_status_job = None
+                self._live_status_target = None
+        elif not running:
+            data["final_pending"] = True
+
     async def _status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
             await self._deny(update)
@@ -845,14 +1142,7 @@ class TelegramControlBot:
             )
             await update.effective_message.reply_text(message)
             return
-        logs, error = self._runner.snapshot()
-        state = "🟢 يعمل" if self._runner.is_running() else "⚪ متوقف"
-        text = f"حالة التشغيل: {state}"
-        if error:
-            text += f"\nآخر خطأ: {error}"
-        if logs:
-            text += "\n\nآخر السجل:\n" + "\n".join(logs[-8:])
-        await update.effective_message.reply_text(text[-3800:])
+        await update.effective_message.reply_text(self._live_status_text())
 
     async def _stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
