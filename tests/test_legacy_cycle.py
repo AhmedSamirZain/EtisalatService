@@ -2,7 +2,6 @@ import importlib.util
 import sys
 import types
 import unittest
-import urllib.parse
 from unittest.mock import patch
 from pathlib import Path
 
@@ -99,9 +98,15 @@ class LegacyCycleTests(unittest.TestCase):
         self.assertEqual(amount, 321)
         method, url, kwargs = api.session.calls[0]
         self.assertEqual(method, "get")
-        self.assertIn("/Saytar/rest/emerald/transferInquiry?req=", url)
-        self.assertIn("transferInquiryRequest", urllib.parse.unquote(url))
+        self.assertEqual(url, bot.BASE_URL + "/Saytar/rest/emerald/transferInquiry")
+        self.assertIn("transferInquiryRequest", kwargs["params"]["req"])
         self.assertEqual(kwargs["timeout"], (5, 60))
+        self.assertEqual(kwargs["headers"]["OS-Version"], "12")
+        self.assertEqual(kwargs["headers"]["C-Type"], "4G")
+        self.assertEqual(
+            kwargs["headers"]["headerSignature"],
+            bot.LEGACY_SIGNATURES["inquiry_owner"]["headerSignature"],
+        )
         self.assertNotIn("verify", kwargs)  # requests keeps TLS verification enabled
 
     def test_transfer_unknown_responses_are_not_treated_as_rejections(self):
@@ -112,6 +117,61 @@ class LegacyCycleTests(unittest.TestCase):
 
         api.session = FakeSession(FakeResponse(text="<response><status>false</status></response>"))
         self.assertFalse(api.transfer_mix(CHILD_DIAL, 10, P270))
+
+    def test_legacy_plan_change_request_uses_exact_body_and_signature(self):
+        api = bot.EtisalatAPI()
+        api.current_dial = OWNER_DIAL
+        api.session = FakeSession(FakeResponse(text="<response><status>true</status></response>"))
+
+        self.assertTrue(api.change_plan(P180, "951"))
+
+        method, url, kwargs = api.session.calls[0]
+        self.assertEqual(method, "post")
+        self.assertEqual(url, bot.BASE_URL + "/Saytar/rest/HekayaPartial/migrate")
+        body = kwargs["data"].decode("utf-8")
+        self.assertIn("<operation>FULL_MIGRATE</operation>", body)
+        self.assertIn("<productName>Hekaya_XRP_MIX_Parent_6</productName>", body)
+        self.assertIn("<ratePlanID>951</ratePlanID>", body)
+        self.assertEqual(
+            kwargs["headers"]["bodySignature"],
+            bot.LEGACY_SIGNATURES["migrate_180"]["bodySignature"],
+        )
+        self.assertEqual(kwargs["headers"]["C-Type"], "4G")
+        self.assertNotIn("verify", kwargs)
+
+    def test_legacy_270_plan_request_uses_legacy_signature(self):
+        api = bot.EtisalatAPI()
+        api.current_dial = OWNER_DIAL
+        api.session = FakeSession(FakeResponse(text="<response><status>true</status></response>"))
+
+        self.assertTrue(api.change_plan(P270, ""))
+
+        headers = api.session.calls[0][2]["headers"]
+        self.assertEqual(
+            headers["bodySignature"],
+            bot.LEGACY_SIGNATURES["migrate_270"]["bodySignature"],
+        )
+
+    def test_legacy_transfer_request_uses_role_specific_signature_and_xml(self):
+        api = bot.EtisalatAPI()
+        api.current_dial = CHILD_DIAL
+        api.account_role = "child"
+        api.session = FakeSession(FakeResponse(text="<response><status>true</status></response>"))
+
+        self.assertTrue(api.transfer_mix(OWNER_DIAL, 1234, CHILD_PRODUCT))
+
+        method, url, kwargs = api.session.calls[0]
+        self.assertEqual(method, "post")
+        self.assertEqual(url, bot.BASE_URL + "/Saytar/rest/services/newTransfer/v2")
+        body = kwargs["data"].decode("utf-8")
+        self.assertIn("<productName>Hekaya_XRP_MIX_Child_1</productName>", body)
+        self.assertIn("<quota>1234</quota>", body)
+        self.assertIn(f"<receiverMsisdn>{OWNER_DIAL}</receiverMsisdn>", body)
+        self.assertEqual(
+            kwargs["headers"]["bodySignature"],
+            bot.LEGACY_SIGNATURES["transfer_child"]["bodySignature"],
+        )
+        self.assertNotIn("verify", kwargs)
 
     def test_cycle_follows_old_six_steps_and_omits_minion_migration(self):
         events = []
@@ -227,14 +287,78 @@ class LegacyCycleTests(unittest.TestCase):
 
         sender = Sender()
         loop = bot.AutoLoop(object(), object(), target_mix=1, retry_settings_provider=lambda: {
-            "transfer_retry_seconds": 1,
+            "transfer_retry_seconds": 3,
             "transfer_retry_limit": 1,
+            "post_transfer_wait_seconds": 0,
         })
-        loop._sleep = lambda seconds: True
+        waits = []
+        loop._sleep = lambda seconds: waits.append(seconds) or True
 
         self.assertTrue(loop._transfer_available_product(sender, CHILD_DIAL, "P", "P", "test"))
         self.assertEqual(sender.sent, [100, 100])
         self.assertEqual(sender.reads, [])
+        self.assertEqual(waits, [3, 3])
+
+    def test_retry_wait_uses_fixed_configured_interval(self):
+        class Sender:
+            def __init__(self):
+                self.sent = 0
+
+            def get_transferable_mix(self, product):
+                return 100
+
+            def transfer_mix(self, receiver, amount, product):
+                self.sent += 1
+                return None
+
+        sender = Sender()
+        loop = bot.AutoLoop(object(), object(), target_mix=1, retry_settings_provider=lambda: {
+            "transfer_retry_seconds": 3,
+            "transfer_retry_limit": 5,
+            "post_transfer_wait_seconds": 0,
+        })
+        waits = []
+
+        def record_wait(seconds):
+            waits.append(seconds)
+            if len(waits) == 3:
+                loop.stop_requested = True
+                return False
+            return True
+
+        loop._sleep = record_wait
+        self.assertFalse(loop._transfer_available_product(sender, CHILD_DIAL, "P", "P", "test"))
+        self.assertEqual(waits, [3, 3, 3])
+        self.assertEqual(sender.sent, 2)
+
+    def test_success_does_not_change_fixed_retry_interval(self):
+        class Sender:
+            def __init__(self):
+                self.results = [True, None]
+
+            def get_transferable_mix(self, product):
+                return 100
+
+            def transfer_mix(self, receiver, amount, product):
+                return self.results.pop(0)
+
+        sender = Sender()
+        loop = bot.AutoLoop(object(), object(), target_mix=1, retry_settings_provider=lambda: {
+            "transfer_retry_seconds": 3,
+            "transfer_retry_limit": 3,
+            "post_transfer_wait_seconds": 0,
+        })
+        waits = []
+
+        def stop_after_next_wait(seconds):
+            waits.append(seconds)
+            loop.stop_requested = True
+            return False
+
+        loop._sleep = stop_after_next_wait
+        self.assertTrue(loop._transfer_available_product(sender, CHILD_DIAL, "P", "P", "first"))
+        self.assertFalse(loop._transfer_available_product(sender, CHILD_DIAL, "P", "P", "second"))
+        self.assertEqual(waits, [3])
 
     def test_changed_inquiry_amount_is_used_instead_of_replaying_old_amount(self):
         class Sender:

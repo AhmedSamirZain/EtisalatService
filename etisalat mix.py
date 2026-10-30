@@ -23,6 +23,39 @@ PLAN_IDS = {
     "Hekaya_XRP_MIX_Parent_8": ("حكاية ميكسات 52",  "52"),
 }
 
+# Operation-specific signatures and request headers ported from the supplied legacy client.
+# These are protocol signatures, not user credentials; TLS verification remains enabled.
+LEGACY_SIGNATURES = {
+    "migrate_270": {
+        "headerSignature": "db5a889033c9e5d767693d0967d621bdc2e5488d3c3153db63ceb706a9bacca88763fbaf2fa7e20202f4ee18a707409f4612d6e05d2beb189f0793ec5c9c7663",
+        "urlSignature": "80c5c15a6bdc1c45be7b875cb49531329d32368a1cbb04963cd6f71cbf9ab563ca1bf10c67158720e879aee85b8d7789c88418d21827ec1499f13b536bbc59ca",
+        "bodySignature": "ae06965020a0e291ce672e1ec6b0a5e7f64fb423074d21f93ffd1bdd005943f57cf4c794d96c8c7cfa75461677deb4d9542936787007eabdc0c287ab005d4cff",
+    },
+    "migrate_180": {
+        "headerSignature": "e5de43ce373d2029adc0c377232e414723618fe18ed19e2e1a7df22f68dcf24e26dc028eaa8ce6e47f567916f7e4f56607e81676a213f45f62547c46680d9608",
+        "urlSignature": "80c5c15a6bdc1c45be7b875cb49531329d32368a1cbb04963cd6f71cbf9ab563ca1bf10c67158720e879aee85b8d7789c88418d21827ec1499f13b536bbc59ca",
+        "bodySignature": "bebb62f931fffdb73e84662d3ce99c6805332bc59a1eb222bc304f918468e1382538b072944666304a9d0d85c20d26bbecf870888115b9afcf6bdc6bb27c8ac4",
+    },
+    "inquiry_owner": {
+        "headerSignature": "f68f4c6bdd00242642bcd0c0718f2faf4d8d15fd0391ed3438f45986f1de2e63976362a540b474f779f57f5bf653654fb660f0e5f0e581c56b6cbe44a6c92174",
+        "urlSignature": "61dce994a58f4f16bbe85126332b344e6e1c43eb59fe6aee7bf53758a568ede4f80a8bf4864e786ff481e03d544116e8bd4f92d36a4a1a2da31d3bee23ab3fc4",
+    },
+    "inquiry_child": {
+        "headerSignature": "ba8c1d3a3515a0d082d1e6ca749910d922f0b47cd7a02fa0c901fb1731ea843959a5195929bccdf943aea0e73f721c5f72d69d5f7362107fc64f5d61ef3a56d1",
+        "urlSignature": "25b03790bd60b52841a34e39d87b9ada63f0a1b1ee700ddc63b030b3ec2fd23115e8c709cd6410ec1e83bd29d457a22f917954fedb6580fae52320434a5a02d6",
+    },
+    "transfer_owner": {
+        "headerSignature": "f68f4c6bdd00242642bcd0c0718f2faf4d8d15fd0391ed3438f45986f1de2e63976362a540b474f779f57f5bf653654fb660f0e5f0e581c56b6cbe44a6c92174",
+        "urlSignature": "dd15f4e5e1cb6178cd6edc9842f406992e73bddcc78a5c7d58f90a1a73d0bab5315d5734e8b9465575fde1c7be0c5926ac95672df50f12493b5c4586286264bd",
+        "bodySignature": "fcf9bc689207d798aa02e249f27163186c130729c761c28b20b046f39ac906a8c9ab9f56d32d22d6bd84a1d0bb30b3056f38119ef6ce2419f07d3432edc7e6fb",
+    },
+    "transfer_child": {
+        "headerSignature": "ba8c1d3a3515a0d082d1e6ca749910d922f0b47cd7a02fa0c901fb1731ea843959a5195929bccdf943aea0e73f721c5f72d69d5f7362107fc64f5d61ef3a56d1",
+        "urlSignature": "dd15f4e5e1cb6178cd6edc9842f406992e73bddcc78a5c7d58f90a1a73d0bab5315d5734e8b9465575fde1c7be0c5926ac95672df50f12493b5c4586286264bd",
+        "bodySignature": "62281bf02fffdd4cfbd814e0b3f574f744111ad4974756476be49462b8a2bc6a1b484d3bc1cb8e7d9847cf6c273dc18ac484c606b686252347ed66525230cb25",
+    },
+}
+
 
 # ============================================================
 # 2) أدوات الطباعة
@@ -113,6 +146,7 @@ class EtisalatAPI:
         self.session = requests.Session()
         self.auth_token = None
         self.current_dial = None
+        self.account_role = "owner"
         self.base_headers = {
             "applicationVersion": "2", "applicationName": "MAB",
             "Accept": "text/xml", "Language": "ar",
@@ -128,6 +162,24 @@ class EtisalatAPI:
         u = hashlib.sha256(url_path.encode()).hexdigest()
         b = hashlib.sha256(body_xml.encode()).hexdigest() if body_xml else ""
         return h, u, b
+
+    def _legacy_operation_headers(self, signature, content_type):
+        headers = self.base_headers.copy()
+        headers.update({
+            "Accept": "text/xml",
+            "OS-Version": "12",
+            "C-Type": "4G",
+            "Host": "mab.etisalat.com.eg:11003",
+            "Connection": "Keep-Alive",
+            "Accept-Encoding": "gzip",
+            "User-Agent": "okhttp/5.0.0-alpha.11",
+            "Content-Type": content_type,
+            "headerSignature": signature["headerSignature"],
+            "urlSignature": signature["urlSignature"],
+        })
+        if "bodySignature" in signature:
+            headers["bodySignature"] = signature["bodySignature"]
+        return headers
 
     def login(self, email, password):
         email = (email or "").strip()
@@ -230,6 +282,13 @@ class EtisalatAPI:
             return None, 0, None
 
     def change_plan(self, plan_name, plan_id=""):
+        if plan_name == "Hekaya_XRP_MIX_Parent_6" and str(plan_id) == "951":
+            signature = LEGACY_SIGNATURES["migrate_180"]
+        elif plan_name == "Hekaya_XRP_MIX_Parent_7" and str(plan_id) == "":
+            signature = LEGACY_SIGNATURES["migrate_270"]
+        else:
+            log_warn(f"رفض طلب تغيير غير مدعوم: {plan_name} / ratePlanID={plan_id}")
+            return False
         xml_body = (
             "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>"
             "<migrateRequest><addonName></addonName><oMSRatePlan>true</oMSRatePlan>"
@@ -240,15 +299,20 @@ class EtisalatAPI:
             "</migrateRequest>"
         )
         url_path = "/Saytar/rest/HekayaPartial/migrate"
-        headers = self.base_headers.copy()
-        h, u, b = self._sign(url_path, xml_body)
-        headers.update({"headerSignature": h, "urlSignature": u, "bodySignature": b})
+        headers = self._legacy_operation_headers(
+            signature, "text/xml; charset=UTF-8"
+        )
         try:
-            r = self.session.post(BASE_URL + url_path, headers=headers,
-                                  data=xml_body, timeout=(5, 60))
-            return r.status_code == 200 and "<status>true</status>" in r.text
-        except Exception as e:
-            log_warn(f"change_plan: {e}")
+            response = self.session.post(
+                BASE_URL + url_path,
+                headers=headers,
+                data=xml_body.encode("utf-8"),
+                timeout=(5, 60),
+            )
+            return response.status_code == 200 and "<status>true</status>" in response.text
+        except Exception as exc:
+            # Do not resend this paid request here; AutoLoop checks the exact plan ID first.
+            log_warn(f"change_plan: {exc}")
             return False
 
     def renew_bundle_action(self, plan_name, amount):
@@ -277,30 +341,32 @@ class EtisalatAPI:
             return False
 
     def get_transferable_mix(self, product_name):
-        """Read the product-specific transferable amount; None means the inquiry was not reliable."""
+        """Query legacy transferInquiry; None means the response was not reliable."""
         if not self.current_dial:
             return None
+        role = "child" if getattr(self, "account_role", "owner") == "child" else "owner"
+        signature = LEGACY_SIGNATURES[f"inquiry_{role}"]
         xml_body = (
             "<transferInquiryRequest>"
             f"<productId>{product_name}</productId>"
             f"<subscriberNumber>{self.current_dial}</subscriberNumber>"
-            "<language>1</language></transferInquiryRequest>"
+            "<language>1</language>"
+            "</transferInquiryRequest>"
         )
-        query = urllib.parse.urlencode({"req": xml_body})
-        url_path = f"/Saytar/rest/emerald/transferInquiry?{query}"
-        headers = self.base_headers.copy()
-        header_signature, url_signature, _ = self._sign(url_path, "")
-        headers.update({"headerSignature": header_signature, "urlSignature": url_signature})
+        url = BASE_URL + "/Saytar/rest/emerald/transferInquiry"
+        headers = self._legacy_operation_headers(signature, "text/xml")
         try:
             response = self.session.get(
-                BASE_URL + url_path, headers=headers, timeout=(5, 60)
+                url,
+                headers=headers,
+                params={"req": xml_body},
+                timeout=(5, 60),
             )
             if response.status_code != 200 or "<status>true</status>" not in response.text:
                 return None
             root = ET.fromstring(response.text)
             for assigned in root.findall(".//assigned"):
-                dial = assigned.findtext("dial")
-                if dial != self.current_dial:
+                if assigned.findtext("dial") != self.current_dial:
                     continue
                 value = assigned.findtext("value")
                 try:
@@ -315,36 +381,42 @@ class EtisalatAPI:
     def transfer_mix(self, receiver_number, quota_amount, product_name):
         try:
             quota = int(quota_amount)
-        except Exception:
+        except (TypeError, ValueError):
             return False
-        if quota <= 0:
+        if quota <= 0 or not self.current_dial or not receiver_number:
             return False
+        role = "child" if getattr(self, "account_role", "owner") == "child" else "owner"
+        signature = LEGACY_SIGNATURES[f"transfer_{role}"]
         xml_body = (
             "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>"
-            "<newFamilyTransferRequest><distribute>false</distribute>"
+            "<newFamilyTransferRequest>"
+            "<distribute>false</distribute>"
             f"<msisdn>{self.current_dial}</msisdn>"
             f"<productName>{product_name}</productName>"
             f"<quota>{quota}</quota>"
             f"<receiverMsisdn>{receiver_number}</receiverMsisdn>"
             f"<senderMsisdn>{self.current_dial}</senderMsisdn>"
-            "<type>UNITS</type></newFamilyTransferRequest>"
+            "<type>UNITS</type>"
+            "</newFamilyTransferRequest>"
         )
-        url_path = "/Saytar/rest/services/newTransfer/v2"
-        headers = self.base_headers.copy()
-        h, u, b = self._sign(url_path, xml_body)
-        headers.update({"headerSignature": h, "urlSignature": u, "bodySignature": b})
+        url = BASE_URL + "/Saytar/rest/services/newTransfer/v2"
+        headers = self._legacy_operation_headers(
+            signature, "text/xml; charset=UTF-8"
+        )
         try:
             response = self.session.post(
-                BASE_URL + url_path, headers=headers, data=xml_body, timeout=(5, 60)
+                url,
+                headers=headers,
+                data=xml_body.encode("utf-8"),
+                timeout=(5, 60),
             )
             if response.status_code == 200 and "<status>true</status>" in response.text:
                 return True
             if "<status>false</status>" in response.text:
                 return False
-            # An incomplete/unrecognized response does not prove the transfer was rejected.
+            # Do not infer rejection from a timeout, HTTP error, or unexpected response body.
             return None
         except Exception as exc:
-            # The request may have reached Etisalat; None is an ambiguous result, not a definite rejection.
             log_warn(f"transfer: {exc}")
             return None
 
@@ -364,6 +436,11 @@ class AutoLoop:
     ):
         self.owner = owner
         self.child = child
+        for account, role in ((self.owner, "owner"), (self.child, "child")):
+            try:
+                account.account_role = role
+            except Exception:
+                pass
         self.target_mix = target_mix
         self.cycle_count = 0
         self.stopped = False
@@ -424,6 +501,15 @@ class AutoLoop:
         unchanged_checks = 0
         polls = 0
         limit_notice_sent = False
+        def wait_before_next_check(reason):
+            delay, _ = self._transfer_retry_settings()
+            self._set_live_state(
+                transfer_retry_wait_seconds=delay,
+                transfer_next_retry_seconds=delay,
+                status=f"{reason}؛ إعادة الفحص بعد {delay} ثانية",
+            )
+            log_info(f"{reason}؛ انتظار ثابت {delay} ثانية قبل إعادة الفحص أو المحاولة التالية.")
+            return self._sleep(delay)
 
         while not self.stopped and not self.stop_requested:
             available = sender.get_transferable_mix(product_id)
@@ -438,6 +524,8 @@ class AutoLoop:
                 transfer_attempts=attempts,
                 transfer_retry_limit=retry_limit,
                 transfer_retry_seconds=interval,
+                transfer_retry_wait_seconds=None,
+                transfer_next_retry_seconds=interval,
                 transfer_amount=available,
             )
             if available is None:
@@ -445,7 +533,7 @@ class AutoLoop:
                     unchanged_checks = 0
                 if polls == 1 or polls % 5 == 0:
                     log_warn(f"تعذر تأكيد الكمية القابلة للتحويل من {label}؛ لن أرسل طلب تحويل غير مؤكد.")
-                if not self._sleep(interval):
+                if not wait_before_next_check("تعذر الاستعلام الموثوق"):
                     return False
                 continue
 
@@ -466,7 +554,7 @@ class AutoLoop:
                             f"نتيجة التحويل السابق ملتبسة والكمية ما زالت {available:,}؛ "
                             "أتحقق مرة أخرى قبل السماح بأي إعادة."
                         )
-                        if not self._sleep(interval):
+                        if not wait_before_next_check("الكمية بقيت نفسها بعد نتيجة ملتبسة"):
                             return False
                         continue
                     log_warn(
@@ -498,7 +586,7 @@ class AutoLoop:
                         "دون إرسال طلبات إضافية حتى تتغير القراءة أو يوقف المدير التشغيل."
                     )
                     limit_notice_sent = True
-                if not self._sleep(interval):
+                if not wait_before_next_check("بلغ حد إعادات التحويل؛ أواصل المراقبة دون إرسال"):
                     return False
                 continue
 
@@ -531,6 +619,11 @@ class AutoLoop:
                     status=f"قُبل تحويل {available:,} ميكس: {label}",
                     transfer_attempts=attempts,
                 )
+                fixed_retry_delay, _ = self._transfer_retry_settings()
+                self._set_live_state(
+                    transfer_retry_wait_seconds=None,
+                    transfer_next_retry_seconds=fixed_retry_delay,
+                )
                 if sender is self.child:
                     self._stop_child_transfer_attempted = True
                     self._stop_child_transfer_accepted = True
@@ -552,7 +645,9 @@ class AutoLoop:
                 log_warn("استجابة التحويل ملتبسة؛ لن أعيد الطلب قبل استعلام جديد، وتأكيد بقاء الكمية في قراءتين.")
             else:
                 log_warn("اتصالات رفضت طلب التحويل؛ سأعيد الاستعلام قبل أي محاولة محدودة أخرى.")
-            if not self._sleep(interval):
+            if not wait_before_next_check(
+                "نتيجة التحويل غير مؤكدة" if result is None else "اتصالات رفضت طلب التحويل"
+            ):
                 return False
         return False
 
