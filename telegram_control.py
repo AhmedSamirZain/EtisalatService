@@ -201,7 +201,8 @@ class TelegramControlBot:
             try:
                 await application.bot.send_message(
                     chat_id=admin_id,
-                    text="✅ بوت اتصالات شغّال الآن ويستقبل الأوامر.\nاكتب /admin لفتح لوحة الإدارة أو /start لعرض الأزرار.",
+                    text="✅ بوت اتصالات شغّال الآن ويستقبل الأوامر.\nاستخدم زر لوحة الإدارة أو أرسل /admin لإدارة المستخدمين.",
+                    reply_markup=self._main_keyboard(is_admin=True),
                 )
             except Exception:
                 runner.add_log(
