@@ -64,11 +64,12 @@ def read_status_until_available(api, should_stop, report, purpose):
     attempt = 0
     while not should_stop():
         if attempt < 6:
-            pause, timeout, mode = 0.25, (2, 3), "سريع"
+            pause, timeout, mode = 0.25, (3, 10), "سريع"
         elif attempt < 12:
-            pause, timeout, mode = 0.75, (3, 5), "متوسط"
+            pause, timeout, mode = 0.75, (5, 30), "متوسط"
         else:
-            pause, timeout, mode = 2.0, (3, 10), "مستمر"
+            # The working legacy client allowed slow Etisalat responses up to 60 seconds.
+            pause, timeout, mode = 2.0, (5, 60), "مستمر"
 
         status = api.get_status_and_child(timeout=timeout)
         if should_stop():
@@ -244,7 +245,7 @@ class EtisalatAPI:
         headers.update({"headerSignature": h, "urlSignature": u, "bodySignature": b})
         try:
             r = self.session.post(BASE_URL + url_path, headers=headers,
-                                  data=xml_body, timeout=10)
+                                  data=xml_body, timeout=(5, 60))
             return r.status_code == 200 and "<status>true</status>" in r.text
         except Exception as e:
             log_warn(f"change_plan: {e}")
@@ -275,10 +276,48 @@ class EtisalatAPI:
             log_warn(f"renew: {e}")
             return False
 
+    def get_transferable_mix(self, product_name):
+        """Read the product-specific transferable amount; None means the inquiry was not reliable."""
+        if not self.current_dial:
+            return None
+        xml_body = (
+            "<transferInquiryRequest>"
+            f"<productId>{product_name}</productId>"
+            f"<subscriberNumber>{self.current_dial}</subscriberNumber>"
+            "<language>1</language></transferInquiryRequest>"
+        )
+        query = urllib.parse.urlencode({"req": xml_body})
+        url_path = f"/Saytar/rest/emerald/transferInquiry?{query}"
+        headers = self.base_headers.copy()
+        header_signature, url_signature, _ = self._sign(url_path, "")
+        headers.update({"headerSignature": header_signature, "urlSignature": url_signature})
+        try:
+            response = self.session.get(
+                BASE_URL + url_path, headers=headers, timeout=(5, 60)
+            )
+            if response.status_code != 200 or "<status>true</status>" not in response.text:
+                return None
+            root = ET.fromstring(response.text)
+            for assigned in root.findall(".//assigned"):
+                dial = assigned.findtext("dial")
+                if dial != self.current_dial:
+                    continue
+                value = assigned.findtext("value")
+                try:
+                    return max(0, int(float(value or 0)))
+                except (TypeError, ValueError):
+                    return None
+            return None
+        except Exception as exc:
+            log_warn(f"transfer inquiry: {exc}")
+            return None
+
     def transfer_mix(self, receiver_number, quota_amount, product_name):
         try:
             quota = int(quota_amount)
         except Exception:
+            return False
+        if quota <= 0:
             return False
         xml_body = (
             "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>"
@@ -295,12 +334,19 @@ class EtisalatAPI:
         h, u, b = self._sign(url_path, xml_body)
         headers.update({"headerSignature": h, "urlSignature": u, "bodySignature": b})
         try:
-            r = self.session.post(BASE_URL + url_path, headers=headers,
-                                  data=xml_body, timeout=10)
-            return r.status_code == 200 and "<status>true</status>" in r.text
-        except Exception as e:
-            log_warn(f"transfer: {e}")
-            return False
+            response = self.session.post(
+                BASE_URL + url_path, headers=headers, data=xml_body, timeout=(5, 60)
+            )
+            if response.status_code == 200 and "<status>true</status>" in response.text:
+                return True
+            if "<status>false</status>" in response.text:
+                return False
+            # An incomplete/unrecognized response does not prove the transfer was rejected.
+            return None
+        except Exception as exc:
+            # The request may have reached Etisalat; None is an ambiguous result, not a definite rejection.
+            log_warn(f"transfer: {exc}")
+            return None
 
 
 # ============================================================
@@ -338,14 +384,190 @@ class AutoLoop:
             except Exception:
                 pass
 
-    def _retry_settings(self):
+    def _runtime_settings(self):
         try:
             settings = self._retry_settings_provider() if self._retry_settings_provider else {}
         except Exception:
             settings = {}
+        return settings if isinstance(settings, dict) else {}
+
+    def _retry_settings(self):
+        settings = self._runtime_settings()
         interval = max(60, int(settings.get("plan_retry_seconds", 240)))
         retry_limit = max(0, int(settings.get("plan_retry_limit", 3)))
         return interval, retry_limit
+
+    def _transfer_retry_settings(self):
+        settings = self._runtime_settings()
+        interval = max(1, int(settings.get("transfer_retry_seconds", 3)))
+        retry_limit = max(0, int(settings.get("transfer_retry_limit", 3)))
+        return interval, retry_limit
+
+    def _migration_settle_seconds(self):
+        try:
+            return max(0, int(self._runtime_settings().get("migration_settle_seconds", 60)))
+        except (TypeError, ValueError):
+            return 60
+
+    def _post_transfer_wait_seconds(self):
+        try:
+            return max(0, int(self._runtime_settings().get("post_transfer_wait_seconds", 3)))
+        except (TypeError, ValueError):
+            return 3
+
+    def _transfer_available_product(self, sender, receiver_number, product_id, product_name, label):
+        """Transfer only an inquiry-confirmed amount, verifying ambiguous outcomes before retry."""
+        interval, retry_limit = self._transfer_retry_settings()
+        attempts = 0
+        pending_amount = None
+        pending_ambiguous = False
+        unchanged_checks = 0
+        polls = 0
+        limit_notice_sent = False
+
+        while not self.stopped and not self.stop_requested:
+            available = sender.get_transferable_mix(product_id)
+            if self.stopped or self.stop_requested:
+                return False
+            polls += 1
+            interval, retry_limit = self._transfer_retry_settings()
+            limit_label = "بلا حد" if retry_limit == 0 else str(retry_limit + 1)
+            self._set_live_state(
+                phase="transfer_inquiry",
+                status=f"استعلام الكمية القابلة للتحويل: {label}",
+                transfer_attempts=attempts,
+                transfer_retry_limit=retry_limit,
+                transfer_retry_seconds=interval,
+                transfer_amount=available,
+            )
+            if available is None:
+                if pending_ambiguous:
+                    unchanged_checks = 0
+                if polls == 1 or polls % 5 == 0:
+                    log_warn(f"تعذر تأكيد الكمية القابلة للتحويل من {label}؛ لن أرسل طلب تحويل غير مؤكد.")
+                if not self._sleep(interval):
+                    return False
+                continue
+
+            available = max(0, int(available))
+            if pending_amount is not None:
+                if available != pending_amount:
+                    log_ok(
+                        f"تغيرت الكمية القابلة للتحويل بعد الطلب من {pending_amount:,} إلى "
+                        f"{available:,}؛ لن أعيد الكمية القديمة، وسأعتمد القراءة الحالية فقط."
+                    )
+                    pending_amount = None
+                    pending_ambiguous = False
+                    unchanged_checks = 0
+                elif pending_ambiguous:
+                    unchanged_checks += 1
+                    if unchanged_checks < 2:
+                        log_warn(
+                            f"نتيجة التحويل السابق ملتبسة والكمية ما زالت {available:,}؛ "
+                            "أتحقق مرة أخرى قبل السماح بأي إعادة."
+                        )
+                        if not self._sleep(interval):
+                            return False
+                        continue
+                    log_warn(
+                        f"استعلامان متتاليان أكدا بقاء {available:,} ميكس بعد النتيجة الملتبسة؛ "
+                        "سأسمح بمحاولة محدودة جديدة."
+                    )
+                    pending_amount = None
+                    pending_ambiguous = False
+                    unchanged_checks = 0
+                else:
+                    # A literal status=false is a confirmed rejection; a fresh inquiry still gates retry.
+                    pending_amount = None
+
+            if available <= 0:
+                log_info(f"استعلام التحويل أكد عدم وجود كمية متاحة في {label}؛ أتجاوز هذه الخطوة.")
+                return True
+
+            if retry_limit and attempts > retry_limit:
+                self._set_live_state(
+                    phase="transfer_retry_limit",
+                    status="بلغت محاولات التحويل حد الإعداد؛ أراقب الكمية دون طلبات جديدة",
+                    transfer_attempts=attempts,
+                    transfer_retry_limit=retry_limit,
+                    transfer_retry_seconds=interval,
+                )
+                if not limit_notice_sent:
+                    log_warn(
+                        f"بلغت حد محاولات التحويل ({limit_label})؛ سأواصل استعلام الكمية "
+                        "دون إرسال طلبات إضافية حتى تتغير القراءة أو يوقف المدير التشغيل."
+                    )
+                    limit_notice_sent = True
+                if not self._sleep(interval):
+                    return False
+                continue
+
+            if self.stop_requested:
+                return False
+            self._set_live_state(
+                phase="transfer_sending",
+                status=f"تحويل {available:,} ميكس: {label}",
+                transfer_amount=available,
+                transfer_attempts=attempts,
+                transfer_retry_limit=retry_limit,
+                transfer_retry_seconds=interval,
+            )
+            log_info(
+                f"استعلام التحويل أكد {available:,} ميكس قابلة للتحويل في {label}؛ "
+                f"إرسال المحاولة {attempts + 1}/{limit_label}."
+            )
+            result = sender.transfer_mix(receiver_number, available, product_name)
+            attempts += 1
+            if self.stop_requested:
+                if sender is self.child:
+                    self._stop_child_transfer_attempted = True
+                    self._stop_child_transfer_accepted = result is True
+                    self._stop_child_transfer_amount = available
+                return False
+            if result is True:
+                log_ok(f"قُبل تحويل {available:,} ميكس في {label}.")
+                self._set_live_state(
+                    phase="transfer_confirmed",
+                    status=f"قُبل تحويل {available:,} ميكس: {label}",
+                    transfer_attempts=attempts,
+                )
+                if sender is self.child:
+                    self._stop_child_transfer_attempted = True
+                    self._stop_child_transfer_accepted = True
+                    self._stop_child_transfer_amount = available
+                post_wait = self._post_transfer_wait_seconds()
+                if post_wait and not self._sleep(post_wait):
+                    return False
+                if sender is self.child:
+                    self._stop_child_transfer_attempted = False
+                    self._stop_child_transfer_accepted = False
+                    self._stop_child_transfer_amount = 0
+                return True
+
+            pending_amount = available
+            pending_ambiguous = result is None
+            unchanged_checks = 0
+            limit_notice_sent = False
+            if result is None:
+                log_warn("استجابة التحويل ملتبسة؛ لن أعيد الطلب قبل استعلام جديد، وتأكيد بقاء الكمية في قراءتين.")
+            else:
+                log_warn("اتصالات رفضت طلب التحويل؛ سأعيد الاستعلام قبل أي محاولة محدودة أخرى.")
+            if not self._sleep(interval):
+                return False
+        return False
+
+    def _settle_after_plan_change(self, plan_id):
+        seconds = self._migration_settle_seconds()
+        if seconds <= 0:
+            return not self.stop_requested
+        self._set_live_state(
+            phase="plan_settling",
+            status=f"انتظار استقرار النظام {plan_id} لمدة {seconds} ثانية",
+            current_plan_id=plan_id,
+            migration_settle_seconds=seconds,
+        )
+        log_info(f"تم تأكيد النظام {plan_id}؛ انتظار استقرار {seconds} ثانية قبل التحويل التالي.")
+        return self._sleep(seconds)
 
     def stop(self):
         """Request a safe stop; final child-to-owner cleanup runs before exit."""
@@ -599,267 +821,212 @@ class AutoLoop:
             log_warn("رد تحويل الإيقاف غير مؤكد؛ لم أعد إرسال التحويل لتجنب تكراره.")
 
     def _run(self):
-        # ---- فحص نظام الأونر ----
-        log_step("فحص النظام الحالي قبل أي عملية...")
+        """Run the approved legacy sequence with exact plan checks and inquiry-gated transfers."""
+        log_step("فحص نظام الأونر قبل بدء الدورة...")
         initial = getattr(self, "initial_status", None)
         if initial is None:
             initial = self._read_initial_status()
         if initial is None or self.stopped or self.stop_requested:
             return
         plan_id, initial_mix, _ = initial
+        parent_270 = "Hekaya_XRP_MIX_Parent_7"
+        parent_180 = "Hekaya_XRP_MIX_Parent_6"
+        child_product = "Hekaya_XRP_MIX_Child_1"
         if not plan_id:
-            log_err("تعذر قراءة النظام الحالي؛ لن يبدأ التجديد أو التحويل")
+            log_err("تعذر قراءة النظام الحالي؛ لن يبدأ أي تحويل أو تغيير باقة")
             return
-
-        current_name, _ = PLAN_IDS.get(plan_id, (plan_id, ""))
-        next_plan = (
-            "Hekaya_XRP_MIX_Parent_6"
-            if "Parent_7" in plan_id
-            else "Hekaya_XRP_MIX_Parent_7"
-        )
-        next_name, _ = PLAN_IDS.get(next_plan, (next_plan, ""))
-        log_info(f"النظام عند البداية: {current_name} ({plan_id})")
-        log_info(f"الرصيد عند البداية: {initial_mix:,} ميكس")
-        log_info(f"النظام التالي حسب الحالة الحالية: {next_name}")
-        self._set_live_state(
-            phase="preparing",
-            status="تجهيز الدورة بعد قراءة النظام الحالي",
-            current_plan_id=plan_id,
-            target_mix=self.target_mix,
-            current_mix=initial_mix,
-        )
-
-        # ---- ترقية النظام ----
-        if plan_id not in PLAN_IDS:
-            log_err(f"النظام الحالي غير معروف ({plan_id})؛ أوقفت التشغيل قبل العمليات")
-            return
-        if "Parent_7" not in plan_id:
-            if self.stop_requested:
-                return
-            target_plan = "Hekaya_XRP_MIX_Parent_7"
+        if plan_id != parent_270:
             self._set_live_state(
-                phase="plan_change_request",
-                status="إرسال طلب الترقية إلى 270",
+                phase="unexpected_start_plan",
+                status="الدورة القديمة تبدأ من 270؛ أوقفت التشغيل دون تغيير تلقائي",
                 current_plan_id=plan_id,
-                target_plan_id=target_plan,
+                target_mix=self.target_mix,
             )
-            log_info(f"النظام الحالي: {plan_id} → جارٍ الترقية إلى 270")
-            accepted = self.owner.change_plan(target_plan)
-            if accepted:
-                log_info("اتصالات قبلت طلب الترقية؛ أنتظر تأكيد ظهور النظام المطلوب.")
-            else:
-                log_warn("رد طلب الترقية غير مؤكد؛ سأتحقق من النظام، وأعيد الطلب فقط بعد المهلة إذا أكدت قراءة ناجحة بقاء الخطة القديمة")
-            if not self._wait_for_plan(target_plan, previous_plan_id=plan_id, target_pid=""):
-                return
-
-        if self.stopped or self.stop_requested:
+            log_err(
+                f"النظام عند البدء هو {plan_id} وليس {parent_270} (270). "
+                "لن أخمّن موضع الدورة أو أغيّر الباقة تلقائيًا؛ راجع حالة الأونر أولًا."
+            )
             return
 
-        # ---- التحقق من الفرد ----
+        log_info(f"النظام عند البداية: حكاية ميكسات 270 ({plan_id})")
+        log_info(f"الرصيد عند البداية: {initial_mix:,} ميكس")
+        self._set_live_state(
+            phase="preparing", status="تجهيز الدورة القديمة بدءًا من 270",
+            current_plan_id=plan_id, target_mix=self.target_mix, current_mix=initial_mix,
+        )
         child_num = self._read_child_number()
         if self.stopped or self.stop_requested:
             return
         if not child_num:
-            log_err("لم يظهر فرد مضاف في ثلاث قراءات ناجحة؛ لم أبدأ أي تجديد أو تحويل")
+            log_err("لم يمكن تأكيد رقم الفرد؛ لم أبدأ أي تحويل أو تغيير باقة")
+            return
+        owner_dial = getattr(self.owner, "current_dial", None)
+        child_dial = getattr(self.child, "current_dial", None)
+        if not owner_dial or not child_dial:
+            log_err("رقم الأونر أو الفرد غير متاح من جلسة الدخول؛ أوقفت التشغيل قبل أي تحويل.")
+            return
+        if str(child_dial) != str(child_num):
+            log_err(f"رقم الفرد المرتبط بالأونر ({child_num}) لا يطابق الحساب المسجل ({child_dial}); أوقفت التشغيل.")
+            return
+        if str(child_num) == str(owner_dial):
+            log_err("رقم الفرد يطابق رقم الأونر؛ أوقفت التشغيل قبل أي تحويل.")
             return
         self.child_num = child_num
-
         log_info(f"الهدف: {self.target_mix:,} ميكس")
-        print()
 
-        # ---- الحلقة الرئيسية ----
         while not self.stopped and not self.stop_requested:
+            status = self._read_status(self.owner, "رصيد الأونر قبل الدورة")
+            if status is None or self.stopped or self.stop_requested:
+                return
+            current_plan, owner_mix, observed_child = status
+            if observed_child:
+                if str(observed_child) != str(child_num):
+                    log_err(
+                        f"تغير رقم الفرد المرتبط من {child_num} إلى {observed_child} أثناء التشغيل؛ "
+                        "أوقفت الدورة قبل التحويل إلى رقم مختلف."
+                    )
+                    return
+                self.child_num = child_num = observed_child
+            if current_plan != parent_270:
+                self._set_live_state(
+                    phase="unexpected_cycle_plan",
+                    status="النظام ليس 270 عند بداية الدورة؛ توقفت دون تغيير تلقائي",
+                    current_plan_id=current_plan, target_mix=self.target_mix,
+                )
+                log_err(f"بداية الدورة تتطلب تأكيد {parent_270} لكن القراءة الحالية {current_plan}؛ توقفت بأمان.")
+                return
+
             self.cycle_count += 1
-            print(f"{C.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
-            log(f"🔄 الدورة رقم {self.cycle_count}", C.BOLD + C.CYAN)
-
-            status = self._read_status(self.owner, "حالة الدورة الحالية")
-            if status is None or self.stopped or self.stop_requested:
-                return
-            plan_id, mix_amount, child_num = status
             self._set_live_state(
-                phase="cycle_status",
-                status=f"فحص الدورة رقم {self.cycle_count}",
-                current_plan_id=plan_id,
-                current_mix=mix_amount,
-                target_mix=self.target_mix,
-                cycle_count=self.cycle_count,
+                phase="cycle_status", status=f"بدء الدورة رقم {self.cycle_count} من النظام 270",
+                current_plan_id=current_plan, current_mix=owner_mix,
+                target_mix=self.target_mix, cycle_count=self.cycle_count,
             )
-            if child_num:
-                self.child_num = child_num
-            else:
-                # Keep using the member already confirmed; a partial status response is not proof of removal.
-                child_num = getattr(self, "child_num", None)
-            if plan_id not in PLAN_IDS:
-                log_err(f"معرّف النظام غير معروف ({plan_id})؛ أوقفت الدورة قبل التجديد أو التحويل")
-                return
-
-            name, price = PLAN_IDS.get(plan_id, ("حكاية ميكسات 270", "270"))
-            log(f"  النظام: {name}", C.GRAY)
-            log(f"  الميكس الحالي: {mix_amount:,}", C.GRAY)
-            log(f"  الهدف: {self.target_mix:,}", C.GRAY)
-            progress = min(100, (mix_amount / self.target_mix * 100) if self.target_mix else 0)
-            bar_len = 30
-            filled = int(bar_len * progress / 100)
-            bar = "█" * filled + "░" * (bar_len - filled)
-            log(f"  [{bar}] {progress:.1f}%", C.YELLOW)
-
-            if not child_num:
-                log_err("لا يوجد فرد مضاف")
-                return
-
-            if mix_amount >= self.target_mix:
-                print()
-                log_ok("=" * 50)
-                log_ok(f"🎉 تم الوصول للهدف!")
-                log_ok(f"   الميكس المحقق: {mix_amount:,}")
-                log_ok(f"   عدد الدورات: {self.cycle_count}")
-                log_ok("=" * 50)
+            log_step(f"الدورة رقم {self.cycle_count}: الأونر على 270")
+            log_info(f"رصيد الأونر: {owner_mix:,} ميكس؛ الهدف: {self.target_mix:,}")
+            if owner_mix >= self.target_mix:
                 self.outcome = "success"
+                self._set_live_state(
+                    phase="success", status="تم بلوغ الهدف", current_plan_id=current_plan,
+                    current_mix=owner_mix, target_mix=self.target_mix,
+                )
+                log_ok(f"تم بلوغ الهدف: {owner_mix:,} ميكس بعد {self.cycle_count - 1} دورة مكتملة.")
                 return
 
-            # ---- تجديد الباقة ----
-            if self.stop_requested:
-                return
+            # 1) Owner's transferable 270 mix -> child.
             self._set_live_state(
-                phase="renewing",
-                status=f"تجديد الباقة {name}",
-                current_plan_id=plan_id,
-                current_mix=mix_amount,
+                phase="transfer_owner_270_to_child",
+                status="استعلام وتحويل الكمية المتاحة من الأونر 270 إلى الفرد",
+                current_plan_id=parent_270, cycle_count=self.cycle_count,
+            )
+            if not self._transfer_available_product(
+                self.owner, child_num, parent_270, parent_270, "الأونر على 270 إلى الفرد"
+            ) or self.stop_requested:
+                return
+
+            # 2) Owner 270 -> 180; no next step before exact confirmation.
+            self._set_live_state(
+                phase="plan_change_request", status="إرسال طلب تغيير الأونر من 270 إلى 180",
+                current_plan_id=parent_270, target_plan_id=parent_180,
                 cycle_count=self.cycle_count,
             )
-            log_info(f"تجديد الباقة ({name})...")
-            if not self.owner.renew_bundle_action(plan_id, price):
-                log_warn("فشل التجديد")
-            if not self._sleep(3):
+            log_info("الخطوة 2/6: تغيير الأونر من 270 إلى 180.")
+            accepted = self.owner.change_plan(parent_180, "951")
+            log_info("قُبل طلب التغيير إلى 180؛ أنتظر المعرّف بالضبط." if accepted else
+                     "نتيجة طلب 180 غير مؤكدة؛ لن أعيد الطلب بسبب timeout أو قراءة غير مقروءة.")
+            if not self._wait_for_plan(parent_180, previous_plan_id=parent_270, target_pid="951"):
+                return
+            if not self._settle_after_plan_change(parent_180):
                 return
 
-            # ---- تحويل الميكس للفرد ----
-            status = self._read_status(self.owner, "رصيد الميكس بعد التجديد")
-            if status is None or self.stopped or self.stop_requested:
-                return
-            _, new_mix, _ = status
-            if new_mix > 0:
-                if self.stop_requested:
-                    return
-                self._set_live_state(
-                    phase="transfer_to_child",
-                    status=f"تحويل {new_mix:,} ميكس للفرد",
-                    current_plan_id=plan_id,
-                    current_mix=mix_amount,
-                    cycle_count=self.cycle_count,
-                )
-                log_info(f"تحويل {new_mix:,} ميكس للفرد {child_num}...")
-                if not self.owner.transfer_mix(child_num, new_mix, plan_id):
-                    log_warn("فشل التحويل، انتظار 10 ثواني...")
-                    if not self._sleep(10):
-                        return
-                    continue
-                log_ok("تم التحويل")
-            else:
-                self._set_live_state(
-                    phase="waiting_for_mix",
-                    status="لا يوجد ميكس جديد؛ أنتظر تحديث الرصيد",
-                    current_plan_id=plan_id,
-                    current_mix=mix_amount,
-                    cycle_count=self.cycle_count,
-                )
-                log_warn("لا يوجد ميكس جديد، انتظار...")
-                if not self._sleep(5):
-                    return
-                status = self._read_status(self.child, "رصيد الفرد")
-                if status is None or self.stopped or self.stop_requested:
-                    return
-                _, child_mix, _ = status
-                if child_mix <= 0:
-                    if not self._sleep(10):
-                        return
-                    continue
-
-            if not self._sleep(2):
-                return
-
-            # ---- تغيير النظام ----
-            if plan_id == "Hekaya_XRP_MIX_Parent_7":
-                target_plan = "Hekaya_XRP_MIX_Parent_6"
-                target_pid = "951"
-            elif plan_id == "Hekaya_XRP_MIX_Parent_6":
-                target_plan = "Hekaya_XRP_MIX_Parent_7"
-                target_pid = ""
-            else:
-                log_err(f"النظام غير مدعوم للتبديل ({plan_id})؛ أوقفت التشغيل")
-                return
-
-            if self.stop_requested:
-                return
+            # 3) Child's transferable balance -> owner while owner is on 180.
             self._set_live_state(
-                phase="plan_change_request",
-                status="إرسال طلب تغيير النظام",
-                current_plan_id=plan_id,
-                target_plan_id=target_plan,
-                target_mix=self.target_mix,
-                retries_done=0,
-                retry_limit=self._retry_settings()[1],
-                retry_interval_seconds=self._retry_settings()[0],
+                phase="transfer_child_to_owner_on_180",
+                status="استعلام وتحويل ميكسات الفرد إلى الأونر بعد تأكيد 180",
+                current_plan_id=parent_180, cycle_count=self.cycle_count,
             )
-            log_info(f"تغيير النظام إلى {target_plan}...")
-            accepted = self.owner.change_plan(target_plan, target_pid)
-            if accepted:
-                log_info("اتصالات قبلت طلب تغيير النظام؛ أنتظر التأكيد قبل أي خطوة أخرى.")
-            else:
-                log_warn("رد تغيير النظام غير مؤكد؛ سأتحقق من الحالة وأعيد الطلب فقط بعد المهلة وقراءة مؤكدة للخطة القديمة")
-
-            # لا نكمل النقل أو الدورة التالية إلا بعد ظهور المعرّف المطلوب بالضبط.
-            log_info(f"فحص سريع لتأكيد الوصول إلى {target_plan}...")
-            if not self._wait_for_plan(
-                target_plan, previous_plan_id=plan_id, target_pid=target_pid
-            ):
+            log_info("الخطوة 3/6: تحويل ميكسات الفرد إلى الأونر بعد تأكيد 180.")
+            if not self._transfer_available_product(
+                self.child, self.owner.current_dial, child_product, child_product,
+                "الفرد إلى الأونر بعد تغيير 180",
+            ) or self.stop_requested:
                 return
 
-            # ---- ترحيل ميكسات الفرد ----
+            # 4) Owner's transferable 180 mix -> child.
             self._set_live_state(
-                phase="child_balance_transfer",
-                status="قراءة رصيد الفرد وترحيله للأونر",
-                current_plan_id=target_plan,
+                phase="transfer_owner_180_to_child",
+                status="استعلام وتحويل الكمية المتاحة من الأونر 180 إلى الفرد",
+                current_plan_id=parent_180, cycle_count=self.cycle_count,
+            )
+            log_info("الخطوة 4/6: تحويل ميكسات الأونر على 180 إلى الفرد.")
+            if not self._transfer_available_product(
+                self.owner, child_num, parent_180, parent_180, "الأونر على 180 إلى الفرد"
+            ) or self.stop_requested:
+                return
+
+            # 5) Owner 180 -> 270; exact confirmation and settling precede step 6.
+            self._set_live_state(
+                phase="plan_change_request", status="إرسال طلب إعادة الأونر من 180 إلى 270",
+                current_plan_id=parent_180, target_plan_id=parent_270,
                 cycle_count=self.cycle_count,
             )
-            log_info("ترحيل ميكسات الفرد للأونر...")
-            status = self._read_status(self.child, "رصيد الفرد بعد تغيير النظام")
-            if status is None or self.stopped or self.stop_requested:
+            log_info("الخطوة 5/6: إعادة باقة الأونر من 180 إلى 270.")
+            accepted = self.owner.change_plan(parent_270, "")
+            log_info("قُبل طلب التغيير إلى 270؛ أنتظر المعرّف بالضبط." if accepted else
+                     "نتيجة طلب 270 غير مؤكدة؛ لن أعيد الطلب بسبب timeout أو قراءة غير مقروءة.")
+            if not self._wait_for_plan(parent_270, previous_plan_id=parent_180, target_pid=""):
                 return
-            _, child_mix, _ = status
-            if child_mix > 0:
-                if self.stop_requested:
-                    return
-                transfer_accepted = self.child.transfer_mix(
-                    self.owner.current_dial,
-                    child_mix,
-                    "Hekaya_XRP_MIX_Child_1",
+            if not self._settle_after_plan_change(parent_270):
+                return
+
+            # 6) Child -> owner while on 270, then inspect owner balance vs target.
+            self._set_live_state(
+                phase="transfer_child_to_owner_on_270",
+                status="استعلام وتحويل ميكسات الفرد إلى الأونر على 270",
+                current_plan_id=parent_270, cycle_count=self.cycle_count,
+            )
+            log_info("الخطوة 6/6: تحويل ميكسات الفرد إلى الأونر على 270.")
+            if not self._transfer_available_product(
+                self.child, self.owner.current_dial, child_product, child_product,
+                "الفرد إلى الأونر بعد تأكيد 270",
+            ) or self.stop_requested:
+                return
+
+            self._set_live_state(
+                phase="target_check", status="قراءة رصيد الأونر بعد اكتمال الخطوات الست",
+                current_plan_id=parent_270, cycle_count=self.cycle_count,
+            )
+            final_status = self._read_status(self.owner, "رصيد الأونر بعد الدورة")
+            if final_status is None or self.stopped or self.stop_requested:
+                return
+            final_plan, final_mix, _ = final_status
+            if final_plan != parent_270:
+                self._set_live_state(
+                    phase="target_check_unexpected_plan",
+                    status="تعذر تأكيد 270 بعد الدورة؛ توقفت دون بدء دورة أخرى",
+                    current_plan_id=final_plan, target_plan_id=parent_270, current_mix=final_mix,
                 )
-                if self.stop_requested:
-                    self._stop_child_transfer_attempted = True
-                    self._stop_child_transfer_accepted = transfer_accepted
-                    self._stop_child_transfer_amount = child_mix
-                    return
-                if transfer_accepted:
-                    log_ok(f"تم ترحيل {child_mix:,} ميكس")
-                else:
-                    log_warn("فشل الترحيل")
-
-            # ---- إعادة تسجيل الأونر ----
-            log_info("إعادة تسجيل دخول الأونر...")
-            # Re-authenticate with the original owner credentials after plan migration.
-            new_owner_api = EtisalatAPI()
-            if new_owner_api.login(self.owner_email, self.owner_pass):
-                self.owner = new_owner_api
-                log_ok("تم إعادة التسجيل")
-
-            log_info("انتظار 20 ثانية قبل الدورة التالية...")
-            if not self._sleep(20):
+                log_err(f"قراءة ما بعد الدورة أعادت النظام {final_plan} بدل {parent_270}؛ لن أبدأ دورة جديدة.")
+                return
+            self._set_live_state(
+                phase="target_check", status="تم فحص رصيد الأونر بعد الدورة",
+                current_plan_id=final_plan, current_mix=final_mix,
+                target_mix=self.target_mix, cycle_count=self.cycle_count,
+            )
+            log_info(f"رصيد الأونر بعد الدورة: {final_mix:,} ميكس؛ الهدف: {self.target_mix:,}.")
+            if final_mix >= self.target_mix:
+                self.outcome = "success"
+                self._set_live_state(
+                    phase="success", status="تم بلوغ الهدف", current_plan_id=final_plan,
+                    current_mix=final_mix, target_mix=self.target_mix,
+                    cycle_count=self.cycle_count,
+                )
+                log_ok(f"تم بلوغ الهدف: {final_mix:,} ميكس بعد {self.cycle_count} دورة.")
+                return
+            log_info("لم يصل الأونر إلى الهدف؛ ستبدأ دورة جديدة بعد قراءة 270 المؤكدة.")
+            if not self._sleep(1):
                 return
 
-
-# ============================================================
 # 5) تفاعل التيرمنال
 # ============================================================
 
