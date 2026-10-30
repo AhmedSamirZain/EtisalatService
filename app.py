@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib.util
 import threading
-import time
 from collections import deque
 from pathlib import Path
 
@@ -50,32 +49,6 @@ class BackgroundRunner:
     def snapshot(self):
         with self._lock:
             return list(self._logs), self._error
-
-    def _read_initial_status(self, owner):
-        """Keep checking without mutations until the current plan can be read or stopped."""
-        attempt = 0
-        while not self._stop_requested:
-            if attempt < 6:
-                pause, timeout, mode = 0.25, (2, 3), "سريع"
-            elif attempt < 12:
-                pause, timeout, mode = 0.75, (3, 5), "متوسط"
-            else:
-                pause, timeout, mode = 2.0, (3, 10), "مستمر"
-
-            status = owner.get_status_and_child(timeout=timeout)
-            if status[0]:
-                self.add_log(f"تمت قراءة النظام بعد {attempt + 1} محاولة ({mode}).")
-                return status
-
-            attempt += 1
-            if attempt == 1 or attempt % 5 == 0:
-                self.add_log(
-                    f"النظام لم يُقرأ بعد ({attempt} محاولة)؛ لا توجد عمليات حسابية أثناء الانتظار."
-                )
-            if self._stop_requested:
-                break
-            time.sleep(pause)
-        return (None, 0, None)
 
     def start(self, owner_email, owner_password, child_email, child_password, target):
         bot = self._bot_module
@@ -124,7 +97,12 @@ class BackgroundRunner:
                 return
 
             self.add_log("قراءة النظام والرصيد قبل بدء أي تجديد أو تحويل...")
-            initial_status = self._read_initial_status(owner)
+            initial_status = bot.read_status_until_available(
+                owner,
+                lambda: self._stop_requested,
+                self.add_log,
+                "النظام والرصيد الحاليين",
+            )
             if self._stop_requested:
                 return
             plan_id, initial_mix, _ = initial_status

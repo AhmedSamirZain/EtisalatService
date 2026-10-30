@@ -56,7 +56,42 @@ def log_ok(msg):    log(f"✅ {msg}", C.GREEN)
 def log_err(msg):   log(f"❌ {msg}", C.RED)
 def log_info(msg):  log(f"ℹ️  {msg}", C.CYAN)
 def log_warn(msg):  log(f"⚠️  {msg}", C.YELLOW)
-def log_step(msg):  log(f"\n▶ {msg}", C.BOLD + C.BLUE)
+def log_step(msg): log(f"\n▶ {msg}", C.BOLD + C.BLUE)
+
+
+def read_status_until_available(api, should_stop, report, purpose):
+    """Single safe status gate shared by preflight, cycle, and transfer decisions."""
+    attempt = 0
+    while not should_stop():
+        if attempt < 6:
+            pause, timeout, mode = 0.25, (2, 3), "سريع"
+        elif attempt < 12:
+            pause, timeout, mode = 0.75, (3, 5), "متوسط"
+        else:
+            pause, timeout, mode = 2.0, (3, 10), "مستمر"
+
+        status = api.get_status_and_child(timeout=timeout)
+        if should_stop():
+            return None
+        if status[0] is not None:
+            if attempt:
+                report(f"تمت قراءة {purpose} بنجاح بعد {attempt + 1} محاولة.")
+            return status
+
+        attempt += 1
+        if attempt == 1 or attempt % 5 == 0:
+            report(
+                f"تعذرت قراءة {purpose} مؤقتاً ({attempt} محاولة، وضع {mode})؛ "
+                "لا توجد عمليات حسابية أثناء الانتظار."
+            )
+
+        deadline = time.monotonic() + pause
+        while not should_stop():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
+    return None
 
 
 def banner():
@@ -189,8 +224,8 @@ class EtisalatAPI:
                 if item.text != self.current_dial:
                     child_number = item.text
             return p_id, r_mix, child_number
-        except Exception as e:
-            log_warn(f"get_status: {e}")
+        except Exception:
+            # The shared retry gate reports transient failures without spamming logs.
             return None, 0, None
 
     def change_plan(self, plan_name, plan_id=""):
@@ -293,63 +328,34 @@ class AutoLoop:
             time.sleep(min(0.1, remaining))
         return False
 
+    def _read_status(self, api, purpose):
+        return read_status_until_available(
+            api, lambda: self.stopped, log_info, purpose
+        )
+
     def _read_initial_status(self):
-        """Retry the read-only preflight until status is readable or manually stopped."""
-        attempt = 0
-        while not self.stopped:
-            if attempt < 6:
-                pause, timeout, mode = 0.25, (2, 3), "سريع"
-            elif attempt < 12:
-                pause, timeout, mode = 0.75, (3, 5), "متوسط"
-            else:
-                pause, timeout, mode = 2.0, (3, 10), "مستمر"
-
-            status = self.owner.get_status_and_child(timeout=timeout)
-            if status[0]:
-                log_info(f"تمت قراءة النظام بعد {attempt + 1} محاولة ({mode})")
-                return status
-
-            attempt += 1
-            if attempt == 1 or attempt % 5 == 0:
-                log_info(f"النظام لم يُقرأ بعد ({attempt} محاولة)؛ لا توجد عمليات أثناء الانتظار.")
-            if not self._sleep(pause):
-                break
-        return (None, 0, None)
+        return self._read_status(self.owner, "النظام والرصيد الحاليين")
 
     def _read_child_number(self):
-        """Retry transient status failures and require repeated readable misses before stopping."""
-        attempt = 0
+        """Require a child number, not just a successful status request, before operations."""
         readable_misses = 0
         while not self.stopped:
-            if attempt < 6:
-                pause, timeout, mode = 0.25, (2, 3), "سريع"
-            elif attempt < 12:
-                pause, timeout, mode = 0.75, (3, 5), "متوسط"
-            else:
-                pause, timeout, mode = 2.0, (3, 10), "مستمر"
-
-            plan_id, _, child_number = self.owner.get_status_and_child(timeout=timeout)
-            if self.stopped:
+            status = self._read_status(self.owner, "بيانات الفرد")
+            if status is None:
                 return None
+            _, _, child_number = status
             if child_number:
                 log_ok(f"تم تأكيد الفرد: {child_number}")
                 return child_number
 
-            if plan_id and plan_id != "Unknown":
-                readable_misses += 1
-                if readable_misses >= 3:
-                    return None
-            else:
-                # A timeout, invalid response, or unparseable plan is not proof that no child exists.
-                readable_misses = 0
-
-            attempt += 1
-            if attempt == 1 or attempt % 5 == 0:
-                log_info(
-                    f"لم تظهر بيانات الفرد بعد ({attempt} محاولة؛ {readable_misses}/3 قراءات ناجحة بلا فرد). "
-                    "لن أبدأ التجديد أو التحويل قبل تأكيده."
-                )
-            if not self._sleep(pause):
+            readable_misses += 1
+            if readable_misses >= 3:
+                return None
+            log_info(
+                f"قراءة الحالة نجحت لكن بيانات الفرد غير ظاهرة ({readable_misses}/3). "
+                "سأعيد الفحص قبل إيقاف التشغيل."
+            )
+            if not self._sleep(min(2.0, 0.25 * (2 ** (readable_misses - 1)))):
                 return None
         return None
 
@@ -358,17 +364,18 @@ class AutoLoop:
         attempt = 0
         while not self.stopped:
             if attempt < 10:
-                pause, timeout, mode = 0.25, (2, 3), "سريع"
+                pause, mode = 0.25, "سريع"
             elif attempt < 20:
-                pause, timeout, mode = 0.75, (3, 5), "متوسط"
+                pause, mode = 0.75, "متوسط"
             else:
-                pause, timeout, mode = 2.0, (3, 10), "مستمر"
+                pause, mode = 2.0, "مستمر"
 
             if not self._sleep(pause):
                 return False
-            current_plan, _, _ = self.owner.get_status_and_child(timeout=timeout)
-            if self.stopped:
+            status = self._read_status(self.owner, f"تأكيد النظام {expected_plan_id}")
+            if status is None or self.stopped:
                 return False
+            current_plan = status[0]
             if current_plan == expected_plan_id:
                 log_ok(f"تم تأكيد النظام المطلوب بالضبط: {current_plan}")
                 return True
@@ -397,9 +404,9 @@ class AutoLoop:
         initial = getattr(self, "initial_status", None)
         if initial is None:
             initial = self._read_initial_status()
-        plan_id, initial_mix, _ = initial
-        if self.stopped:
+        if initial is None or self.stopped:
             return
+        plan_id, initial_mix, _ = initial
         if not plan_id:
             log_err("تعذر قراءة النظام الحالي؛ لن يبدأ التجديد أو التحويل")
             return
@@ -448,14 +455,10 @@ class AutoLoop:
             print(f"{C.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
             log(f"🔄 الدورة رقم {self.cycle_count}", C.BOLD + C.CYAN)
 
-            plan_id, mix_amount, child_num = self.owner.get_status_and_child(timeout=(2, 3))
-            if self.stopped:
+            status = self._read_status(self.owner, "حالة الدورة الحالية")
+            if status is None or self.stopped:
                 return
-            if not plan_id:
-                log_warn("فشل قراءة النظام، انتظار 5 ثواني...")
-                if not self._sleep(5):
-                    return
-                continue
+            plan_id, mix_amount, child_num = status
             if child_num:
                 self.child_num = child_num
             else:
@@ -496,9 +499,10 @@ class AutoLoop:
                 return
 
             # ---- تحويل الميكس للفرد ----
-            _, new_mix, _ = self.owner.get_status_and_child(timeout=(2, 3))
-            if self.stopped:
+            status = self._read_status(self.owner, "رصيد الميكس بعد التجديد")
+            if status is None or self.stopped:
                 return
+            _, new_mix, _ = status
             if new_mix > 0:
                 log_info(f"تحويل {new_mix:,} ميكس للفرد {child_num}...")
                 if not self.owner.transfer_mix(child_num, new_mix, plan_id):
@@ -511,7 +515,10 @@ class AutoLoop:
                 log_warn("لا يوجد ميكس جديد، انتظار...")
                 if not self._sleep(5):
                     return
-                _, child_mix, _ = self.child.get_status_and_child(timeout=(2, 3))
+                status = self._read_status(self.child, "رصيد الفرد")
+                if status is None or self.stopped:
+                    return
+                _, child_mix, _ = status
                 if child_mix <= 0:
                     if not self._sleep(10):
                         return
@@ -542,7 +549,10 @@ class AutoLoop:
 
             # ---- ترحيل ميكسات الفرد ----
             log_info("ترحيل ميكسات الفرد للأونر...")
-            _, child_mix, _ = self.child.get_status_and_child(timeout=(2, 3))
+            status = self._read_status(self.child, "رصيد الفرد بعد تغيير النظام")
+            if status is None or self.stopped:
+                return
+            _, child_mix, _ = status
             if child_mix > 0:
                 if self.child.transfer_mix(self.owner.current_dial, child_mix,
                                            "Hekaya_XRP_MIX_Child_1"):
@@ -611,7 +621,10 @@ def main():
     # ---- 3) قراءة الحالة ----
     print()
     log_step("قراءة الحالة الحالية...")
-    plan_id, mix_amount, child_num = owner_api.get_status_and_child()
+    status = read_status_until_available(owner_api, lambda: False, log_info, "الحالة الحالية")
+    if status is None:
+        return
+    plan_id, mix_amount, child_num = status
     if plan_id:
         name, _ = PLAN_IDS.get(plan_id, (plan_id, ""))
         log_info(f"النظام الحالي: {name}")
