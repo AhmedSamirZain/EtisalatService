@@ -293,24 +293,55 @@ class AutoLoop:
             time.sleep(min(0.1, remaining))
         return False
 
+    def _read_initial_status(self):
+        """Retry the read-only preflight until status is readable or manually stopped."""
+        attempt = 0
+        while not self.stopped:
+            if attempt < 6:
+                pause, timeout, mode = 0.25, (2, 3), "سريع"
+            elif attempt < 12:
+                pause, timeout, mode = 0.75, (3, 5), "متوسط"
+            else:
+                pause, timeout, mode = 2.0, (3, 10), "مستمر"
+
+            status = self.owner.get_status_and_child(timeout=timeout)
+            if status[0]:
+                log_info(f"تمت قراءة النظام بعد {attempt + 1} محاولة ({mode})")
+                return status
+
+            attempt += 1
+            if attempt == 1 or attempt % 5 == 0:
+                log_info(f"النظام لم يُقرأ بعد ({attempt} محاولة)؛ لا توجد عمليات أثناء الانتظار.")
+            if not self._sleep(pause):
+                break
+        return (None, 0, None)
+
     def _wait_for_plan(self, expected_plan_id):
-        """Poll quickly, then allow a few longer server responses; require an exact match."""
-        fast_attempts = 6
-        slow_attempts = 2
-        total = fast_attempts + slow_attempts
-        for attempt in range(total):
+        """Poll rapidly first, then keep checking until exact confirmation or manual stop."""
+        attempt = 0
+        while not self.stopped:
+            if attempt < 10:
+                pause, timeout, mode = 0.25, (2, 3), "سريع"
+            elif attempt < 20:
+                pause, timeout, mode = 0.75, (3, 5), "متوسط"
+            else:
+                pause, timeout, mode = 2.0, (3, 10), "مستمر"
+
+            if not self._sleep(pause):
+                return False
+            current_plan, _, _ = self.owner.get_status_and_child(timeout=timeout)
             if self.stopped:
                 return False
-            fast = attempt < fast_attempts
-            if not self._sleep(0.25 if fast else 1.0):
-                return False
-            timeout = (2, 3) if fast else (3, 10)
-            current_plan, _, _ = self.owner.get_status_and_child(timeout=timeout)
             if current_plan == expected_plan_id:
-                log_ok(f"تم تأكيد النظام المطلوب: {current_plan}")
+                log_ok(f"تم تأكيد النظام المطلوب بالضبط: {current_plan}")
                 return True
-            log_info(f"فحص النظام بعد التغيير: {attempt + 1}/{total}")
-        log_err(f"لم يتم تأكيد النظام المطلوب {expected_plan_id}؛ لن أكمل إلى عملية أخرى")
+
+            attempt += 1
+            if attempt == 1 or attempt % 5 == 0:
+                log_info(
+                    f"لسه بأكد النظام المطلوب {expected_plan_id}؛ المحاولة {attempt} ({mode}). "
+                    "مش هبدأ العملية التالية قبل التأكيد."
+                )
         return False
 
     def run(self):
@@ -328,7 +359,7 @@ class AutoLoop:
         log_step("فحص النظام الحالي قبل أي عملية...")
         initial = getattr(self, "initial_status", None)
         if initial is None:
-            initial = self.owner.get_status_and_child(timeout=(3, 10))
+            initial = self._read_initial_status()
         plan_id, initial_mix, _ = initial
         if self.stopped:
             return
@@ -355,8 +386,7 @@ class AutoLoop:
             target_plan = "Hekaya_XRP_MIX_Parent_7"
             log_info(f"النظام الحالي: {plan_id} → جارٍ الترقية إلى 270")
             if not self.owner.change_plan(target_plan):
-                log_err("طلب الترقية إلى 270 لم يُقبل؛ أوقفت التشغيل")
-                return
+                log_warn("رد طلب الترقية غير مؤكد؛ سأفحص النظام دون إعادة إرسال الطلب")
             if not self._wait_for_plan(target_plan):
                 return
 
@@ -459,8 +489,7 @@ class AutoLoop:
 
             log_info(f"تغيير النظام إلى {target_plan}...")
             if not self.owner.change_plan(target_plan, target_pid):
-                log_err("طلب تغيير النظام لم يُقبل؛ أوقفت التشغيل بدل بدء دورة أخرى")
-                return
+                log_warn("رد تغيير النظام غير مؤكد؛ سأفحص الحالة دون إعادة إرسال الطلب")
 
             # لا نكمل النقل أو الدورة التالية إلا بعد ظهور المعرّف المطلوب بالضبط.
             log_info(f"فحص سريع لتأكيد الوصول إلى {target_plan}...")

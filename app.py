@@ -52,16 +52,30 @@ class BackgroundRunner:
             return list(self._logs), self._error
 
     def _read_initial_status(self, owner):
-        """Use a realistic response window and one bounded retry before any actions."""
-        status = (None, 0, None)
-        for attempt in range(2):
-            status = owner.get_status_and_child(timeout=(3, 10))
+        """Keep checking without mutations until the current plan can be read or stopped."""
+        attempt = 0
+        while not self._stop_requested:
+            if attempt < 6:
+                pause, timeout, mode = 0.25, (2, 3), "سريع"
+            elif attempt < 12:
+                pause, timeout, mode = 0.75, (3, 5), "متوسط"
+            else:
+                pause, timeout, mode = 2.0, (3, 10), "مستمر"
+
+            status = owner.get_status_and_child(timeout=timeout)
             if status[0]:
+                self.add_log(f"تمت قراءة النظام بعد {attempt + 1} محاولة ({mode}).")
                 return status
-            if attempt == 0:
-                self.add_log("قراءة البداية لم ترد؛ إعادة الفحص مرة واحدة بمهلة أطول...")
-                time.sleep(1)
-        return status
+
+            attempt += 1
+            if attempt == 1 or attempt % 5 == 0:
+                self.add_log(
+                    f"النظام لم يُقرأ بعد ({attempt} محاولة)؛ لا توجد عمليات حسابية أثناء الانتظار."
+                )
+            if self._stop_requested:
+                break
+            time.sleep(pause)
+        return (None, 0, None)
 
     def start(self, owner_email, owner_password, child_email, child_password, target):
         bot = self._bot_module
@@ -111,6 +125,8 @@ class BackgroundRunner:
 
             self.add_log("قراءة النظام والرصيد قبل بدء أي تجديد أو تحويل...")
             initial_status = self._read_initial_status(owner)
+            if self._stop_requested:
+                return
             plan_id, initial_mix, _ = initial_status
             if not plan_id:
                 raise RuntimeError("تعذرت قراءة النظام الحالي؛ أوقفت التشغيل قبل أي عملية.")
