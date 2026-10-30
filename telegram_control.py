@@ -581,8 +581,8 @@ class TelegramControlBot:
             "⚙️ إعدادات التشغيل التلقائي\n\n"
             f"⏱ مهلة إعادة طلب تغيير النظام: كل {settings['plan_retry_minutes']} دقائق.\n"
             f"🔁 أقصى إعادات تغيير النظام بعد الطلب الأول: {plan_limit}.\n"
-            f"🔄 مهلة إعادة التحويل تبدأ بـ{settings['transfer_retry_seconds']} ث، وتزيد ثانية مع كل انتظار "
-            f"حتى 60 ث؛ وعدد الإعادات {transfer_limit} بعد المحاولة الأولى.\n"
+            f"🔄 مهلة إعادة التحويل تبدأ بـ{settings['transfer_retry_seconds']} ث؛ تزيد ثانية بعد الفشل حتى 60، "
+            f"وتنقص ثانية بعد النجاح ولا تقل عن قيمة البداية. الإعادات: {transfer_limit} بعد الأولى.\n"
             f"⏳ انتظار الاستقرار بعد تغيير النظام: {settings['migration_settle_seconds']} ثانية.\n"
             f"⏱ مهلة بعد نجاح التحويل: {settings['post_transfer_wait_seconds']} ثانية.\n"
             f"📲 تحديث رسالة الحالة: كل {settings['status_refresh_seconds']} ثوانٍ.\n\n"
@@ -1072,6 +1072,8 @@ class TelegramControlBot:
                 text += f"\n📨 الكمية المستعلم عنها: {int(state['transfer_amount']):,} ميكس"
             if state.get("transfer_retry_wait_seconds") is not None:
                 text += f"\n⏱ الانتظار قبل الفحص/المحاولة التالية: {state['transfer_retry_wait_seconds']} ث"
+            if state.get("transfer_next_retry_seconds") is not None:
+                text += f"\n🧠 مهلة المحاولة التالية بعد التكيّف: {state['transfer_next_retry_seconds']} ث"
         if target:
             text += f"\n🎯 النظام المطلوب: {self._plan_label(target)}"
             interval = max(1, int(state.get("retry_interval_seconds", 240)))

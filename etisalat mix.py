@@ -449,6 +449,7 @@ class AutoLoop:
         self._stop_child_transfer_attempted = False
         self._stop_child_transfer_accepted = False
         self._stop_child_transfer_amount = 0
+        self._transfer_backoff_seconds = None
         self._retry_settings_provider = retry_settings_provider
         self._status_callback = status_callback
         self._live_state = {"phase": "starting", "status": "بدء التشغيل", "target_mix": target_mix}
@@ -480,6 +481,27 @@ class AutoLoop:
         retry_limit = max(0, int(settings.get("transfer_retry_limit", 3)))
         return interval, retry_limit
 
+    def _current_transfer_backoff(self):
+        base_interval, _ = self._transfer_retry_settings()
+        current = self._transfer_backoff_seconds
+        if current is None:
+            current = base_interval
+        else:
+            current = max(base_interval, int(current))
+        self._transfer_backoff_seconds = min(60, current)
+        return self._transfer_backoff_seconds
+
+    def _increase_transfer_backoff(self):
+        self._transfer_backoff_seconds = min(60, self._current_transfer_backoff() + 1)
+        return self._transfer_backoff_seconds
+
+    def _decrease_transfer_backoff_after_success(self):
+        base_interval, _ = self._transfer_retry_settings()
+        self._transfer_backoff_seconds = max(
+            base_interval, self._current_transfer_backoff() - 1
+        )
+        return self._transfer_backoff_seconds
+
     def _migration_settle_seconds(self):
         try:
             return max(0, int(self._runtime_settings().get("migration_settle_seconds", 60)))
@@ -501,21 +523,18 @@ class AutoLoop:
         unchanged_checks = 0
         polls = 0
         limit_notice_sent = False
-        retry_step = 0
-        last_retry_delay = 0
-
         def wait_before_next_check(reason):
-            nonlocal retry_step, last_retry_delay
-            base_interval, _ = self._transfer_retry_settings()
-            delay = min(60, max(base_interval + retry_step, last_retry_delay + 1))
-            retry_step += 1
-            last_retry_delay = delay
+            delay = self._current_transfer_backoff()
             self._set_live_state(
                 transfer_retry_wait_seconds=delay,
                 status=f"{reason}؛ إعادة الفحص بعد {delay} ثانية",
             )
             log_info(f"{reason}؛ انتظار {delay} ثانية قبل إعادة الفحص أو المحاولة التالية.")
-            return self._sleep(delay)
+            if not self._sleep(delay):
+                return False
+            next_delay = self._increase_transfer_backoff()
+            self._set_live_state(transfer_next_retry_seconds=next_delay)
+            return True
 
         while not self.stopped and not self.stop_requested:
             available = sender.get_transferable_mix(product_id)
@@ -531,6 +550,7 @@ class AutoLoop:
                 transfer_retry_limit=retry_limit,
                 transfer_retry_seconds=interval,
                 transfer_retry_wait_seconds=None,
+                transfer_next_retry_seconds=self._current_transfer_backoff(),
                 transfer_amount=available,
             )
             if available is None:
@@ -623,6 +643,14 @@ class AutoLoop:
                     phase="transfer_confirmed",
                     status=f"قُبل تحويل {available:,} ميكس: {label}",
                     transfer_attempts=attempts,
+                )
+                next_delay = self._decrease_transfer_backoff_after_success()
+                self._set_live_state(
+                    transfer_retry_wait_seconds=None,
+                    transfer_next_retry_seconds=next_delay,
+                )
+                log_info(
+                    f"نجح التحويل؛ خفّضت مهلة إعادة المحاولة للعملية التالية إلى {next_delay} ثانية."
                 )
                 if sender is self.child:
                     self._stop_child_transfer_attempted = True

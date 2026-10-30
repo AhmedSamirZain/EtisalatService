@@ -334,6 +334,25 @@ class LegacyCycleTests(unittest.TestCase):
         self.assertEqual(waits, [3, 4, 5])
         self.assertEqual(sender.sent, 2)
 
+    def test_success_reduces_adaptive_delay_for_the_next_operation(self):
+        class Sender:
+            def get_transferable_mix(self, product):
+                return 100
+
+            def transfer_mix(self, receiver, amount, product):
+                return True
+
+        loop = bot.AutoLoop(object(), object(), target_mix=1, retry_settings_provider=lambda: {
+            "transfer_retry_seconds": 3,
+            "transfer_retry_limit": 3,
+            "post_transfer_wait_seconds": 0,
+        })
+        loop._transfer_backoff_seconds = 6
+        loop._sleep = lambda seconds: True
+
+        self.assertTrue(loop._transfer_available_product(Sender(), CHILD_DIAL, "P", "P", "test"))
+        self.assertEqual(loop._transfer_backoff_seconds, 5)
+
     def test_changed_inquiry_amount_is_used_instead_of_replaying_old_amount(self):
         class Sender:
             def __init__(self):
