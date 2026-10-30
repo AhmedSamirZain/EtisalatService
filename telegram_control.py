@@ -68,6 +68,7 @@ class TelegramControlBot:
             self._token = token
             self._admin_id = admin_id
             self._runner = runner
+            runner.set_completion_callback(self._activation_completed)
 
     def _init_users_db(self):
         self._users_db.parent.mkdir(parents=True, exist_ok=True)
@@ -75,6 +76,33 @@ class TelegramControlBot:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS authorized_users ("
                 "user_id INTEGER PRIMARY KEY, added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS user_quotas ("
+                "user_id INTEGER PRIMARY KEY, granted_total INTEGER NOT NULL DEFAULT 0, "
+                "remaining INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, "
+                "successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, "
+                "stopped INTEGER NOT NULL DEFAULT 0)"
+            )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS activations ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, target INTEGER NOT NULL, "
+                "status TEXT NOT NULL DEFAULT 'running', started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+                "finished_at TEXT)"
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO user_quotas(user_id) SELECT user_id FROM authorized_users"
+            )
+            db.execute(
+                "UPDATE user_quotas SET stopped = stopped + ("
+                "SELECT COUNT(*) FROM activations WHERE activations.user_id = user_quotas.user_id "
+                "AND activations.status = 'running') "
+                "WHERE EXISTS (SELECT 1 FROM activations WHERE activations.user_id = user_quotas.user_id "
+                "AND activations.status = 'running')"
+            )
+            db.execute(
+                "UPDATE activations SET status = 'stopped', finished_at = CURRENT_TIMESTAMP "
+                "WHERE status = 'running'"
             )
 
     def _authorized_user_ids(self) -> list[int]:
@@ -87,12 +115,90 @@ class TelegramControlBot:
             cursor = db.execute(
                 "INSERT OR IGNORE INTO authorized_users(user_id) VALUES (?)", (user_id,)
             )
+            db.execute("INSERT OR IGNORE INTO user_quotas(user_id) VALUES (?)", (user_id,))
             return cursor.rowcount == 1
 
     def _remove_authorized_user(self, user_id: int) -> bool:
         with self._lock, closing(sqlite3.connect(self._users_db)) as db, db:
             cursor = db.execute("DELETE FROM authorized_users WHERE user_id = ?", (user_id,))
             return cursor.rowcount == 1
+
+    def _quota_info(self, user_id: int):
+        with self._lock, closing(sqlite3.connect(self._users_db)) as db, db:
+            row = db.execute(
+                "SELECT granted_total, remaining, attempts, successes, failures, stopped "
+                "FROM user_quotas WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        keys = ("granted", "remaining", "attempts", "successes", "failures", "stopped")
+        return dict(zip(keys, map(int, row)))
+
+    def _grant_activations(self, user_id: int, amount: int) -> bool:
+        if amount <= 0:
+            return False
+        with self._lock, closing(sqlite3.connect(self._users_db)) as db, db:
+            cursor = db.execute(
+                "UPDATE user_quotas SET granted_total = granted_total + ?, remaining = remaining + ? "
+                "WHERE user_id = ? AND EXISTS (SELECT 1 FROM authorized_users WHERE user_id = ?)",
+                (amount, amount, user_id, user_id),
+            )
+            return cursor.rowcount == 1
+
+    def _reserve_activation(self, user_id: int, target: int):
+        """Consume one activation atomically when an authorized user's run is confirmed."""
+        with self._lock, closing(sqlite3.connect(self._users_db)) as db, db:
+            cursor = db.execute(
+                "UPDATE user_quotas SET remaining = remaining - 1, attempts = attempts + 1 "
+                "WHERE user_id = ? AND remaining > 0 "
+                "AND EXISTS (SELECT 1 FROM authorized_users WHERE user_id = ?)",
+                (user_id, user_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            inserted = db.execute(
+                "INSERT INTO activations(user_id, target, status) VALUES (?, ?, 'running')",
+                (user_id, target),
+            )
+            return int(inserted.lastrowid)
+
+    def _refund_activation(self, activation_id: int):
+        with self._lock, closing(sqlite3.connect(self._users_db)) as db, db:
+            row = db.execute(
+                "SELECT user_id FROM activations WHERE id = ? AND status = 'running'",
+                (activation_id,),
+            ).fetchone()
+            if row is None:
+                return
+            db.execute(
+                "UPDATE user_quotas SET remaining = remaining + 1, "
+                "attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END WHERE user_id = ?",
+                (row[0],),
+            )
+            db.execute("DELETE FROM activations WHERE id = ?", (activation_id,))
+
+    def _activation_completed(self, user_id: int, activation_id: int, outcome: str):
+        status = outcome if outcome in {"success", "failed", "stopped"} else "failed"
+        counter = {"success": "successes", "failed": "failures", "stopped": "stopped"}[status]
+        with self._lock, closing(sqlite3.connect(self._users_db)) as db, db:
+            cursor = db.execute(
+                "UPDATE activations SET status = ?, finished_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND user_id = ? AND status = 'running'",
+                (status, activation_id, user_id),
+            )
+            if cursor.rowcount == 1:
+                db.execute(
+                    f"UPDATE user_quotas SET {counter} = {counter} + 1 WHERE user_id = ?",
+                    (user_id,),
+                )
+
+    def _activation_history(self, user_id: int, limit=10):
+        with self._lock, closing(sqlite3.connect(self._users_db)) as db, db:
+            rows = db.execute(
+                "SELECT target, status, started_at, finished_at FROM activations "
+                "WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit)
+            ).fetchall()
+        return rows
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -170,9 +276,11 @@ class TelegramControlBot:
         application.add_handler(CommandHandler("admin", self._admin_panel))
         application.add_handler(CommandHandler("adduser", self._add_user_command))
         application.add_handler(CommandHandler("removeuser", self._remove_user_command))
+        application.add_handler(CommandHandler("grant", self._grant_command))
         application.add_handler(CommandHandler("users", self._users_command))
+        application.add_handler(CommandHandler("userstats", self._userstats_command))
         application.add_handler(MessageHandler(filters.Regex(r"^👥 لوحة الإدارة$"), self._admin_panel))
-        application.add_handler(CallbackQueryHandler(self._admin_callback, pattern=r"^admin:(users|add_help|remove_help)$"))
+        application.add_handler(CallbackQueryHandler(self._admin_callback, pattern=r"^admin:(users|add_help|remove_help|grant_help)$"))
         application.add_handler(CommandHandler("start", self._start_command))
         application.add_handler(CommandHandler("help", self._help_command))
         application.add_handler(MessageHandler(filters.Regex(r"^ℹ️ مساعدة$"), self._help_command))
@@ -290,6 +398,9 @@ class TelegramControlBot:
         text = "✅ البوت شغال ويستقبل الأوامر.\nأهلًا! اختار زر من القائمة: تشغيل، الحالة، إيقاف، أو إلغاء.\nتقدر تستخدم /run 50000 أو /help."
         if is_admin:
             text += "\nلوحة إدارة المستخدمين: /admin."
+        else:
+            stats = self._quota_info(update.effective_user.id) or {"remaining": 0}
+            text += f"\nالتفعيلات المتبقية: {stats['remaining']}."
         await update.effective_message.reply_text(
             text,
             reply_markup=self._main_keyboard(is_admin=is_admin),
@@ -321,6 +432,7 @@ class TelegramControlBot:
                 InlineKeyboardButton("➕ طريقة الإضافة", callback_data="admin:add_help"),
                 InlineKeyboardButton("➖ طريقة الحذف", callback_data="admin:remove_help"),
             ],
+            [InlineKeyboardButton("🎟 منح تفعيلات", callback_data="admin:grant_help")],
         ])
 
     async def _admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -330,9 +442,11 @@ class TelegramControlBot:
         await update.effective_message.reply_text(
             "👥 لوحة إدارة المستخدمين\n"
             "إضافة: /adduser ثم رقم Telegram ID.\n"
-            "حذف: /removeuser ثم رقم Telegram ID.\n"
-            "عرض القائمة: /users.\n\n"
-            "كل مستخدم يشغّل ببيانات حساباته بنفسه، وتشغيل واحد فقط مسموح في نفس الوقت.",
+            "منح تفعيلات: /grant ثم ID ثم العدد.\n"
+            "عرض القائمة والتقارير: /users أو /userstats ثم ID.\n"
+            "حذف: /removeuser ثم رقم Telegram ID.\n\n"
+            "التفعيل يُخصم عند بدء التشغيل المؤكد؛ وتُسجّل المحاولات والنجاحات والإخفاقات والإيقافات.\n"
+            "كل مستخدم يشغّل ببياناته بنفسه، وتشغيل واحد فقط مسموح في نفس الوقت.",
             reply_markup=self._admin_keyboard(),
         )
 
@@ -346,16 +460,29 @@ class TelegramControlBot:
             ids = self._authorized_user_ids()
             with self._lock:
                 admin_id = self._admin_id
-            lines = [f"• {admin_id} — المسؤول الرئيسي"]
-            lines.extend(f"• {user_id}" for user_id in ids if user_id != admin_id)
+            lines = [f"• {admin_id} — المسؤول الرئيسي (غير محدود)"]
+            for user_id in ids:
+                if user_id == admin_id:
+                    continue
+                stats = self._quota_info(user_id) or {}
+                lines.append(
+                    f"• {user_id}: ممنوح {stats.get('granted', 0)}، متبقي {stats.get('remaining', 0)}، "
+                    f"محاولات {stats.get('attempts', 0)}، نجاح {stats.get('successes', 0)}"
+                )
             await query.edit_message_text(
-                "المستخدمون المصرّح لهم:\n" + "\n".join(lines),
+                "المستخدمون والتفعيلات:\n" + "\n".join(lines)[-3800:],
                 reply_markup=self._admin_keyboard(),
             )
         elif query.data == "admin:add_help":
             await query.edit_message_text(
                 "لإضافة شخص: خليه يفتح البوت ويرسل /start، ثم يبعث لك رقم Telegram ID الظاهر له.\n"
                 "بعدها أرسل: /adduser 123456789",
+                reply_markup=self._admin_keyboard(),
+            )
+        elif query.data == "admin:grant_help":
+            await query.edit_message_text(
+                "لمنح تفعيلات لمستخدم مضاف أرسل: /grant 123456789 10.\n"
+                "يُخصم تفعيل واحد عند تأكيد بدء التشغيل، وتُسجل النتيجة عند انتهاء المحاولة.",
                 reply_markup=self._admin_keyboard(),
             )
         else:
@@ -385,7 +512,7 @@ class TelegramControlBot:
             return
         if self._add_authorized_user(user_id):
             await update.effective_message.reply_text(
-                f"✅ تمت إضافة المستخدم {user_id}. اطلب منه إرسال /start للبوت؛ التشغيل متاح له في محادثة خاصة."
+                f"✅ تمت إضافة المستخدم {user_id} بصفر تفعيلات. اطلب منه /start ثم امنحه الرصيد بـ /grant {user_id} 10."
             )
         else:
             await update.effective_message.reply_text("هذا المستخدم موجود بالفعل في القائمة.")
@@ -409,16 +536,77 @@ class TelegramControlBot:
             self._active_user_id = None
         await update.effective_message.reply_text(f"✅ تم حذف المستخدم {user_id} من القائمة.")
 
+    async def _grant_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            await self._deny(update)
+            return
+        if len(context.args) != 2 or not context.args[1].isdigit():
+            await update.effective_message.reply_text("الاستخدام: /grant 123456789 10")
+            return
+        user_id = self._parse_user_id(context.args[:1])
+        amount = int(context.args[1])
+        if user_id is None or not 1 <= amount <= 1_000_000:
+            await update.effective_message.reply_text("اكتب Telegram ID صحيحًا وعدد تفعيلات من 1 إلى 1,000,000.")
+            return
+        if not self._grant_activations(user_id, amount):
+            await update.effective_message.reply_text("أضف المستخدم أولًا باستخدام /adduser ID.")
+            return
+        stats = self._quota_info(user_id)
+        await update.effective_message.reply_text(
+            f"✅ تمت إضافة {amount} تفعيل للمستخدم {user_id}. المتاح الآن: {stats['remaining']}."
+        )
+
     async def _users_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_admin(update):
             await self._deny(update)
             return
         with self._lock:
             admin_id = self._admin_id
-        ids = self._authorized_user_ids()
-        lines = [f"• {admin_id} — المسؤول الرئيسي"]
-        lines.extend(f"• {user_id}" for user_id in ids if user_id != admin_id)
-        await update.effective_message.reply_text("المستخدمون المصرّح لهم:\n" + "\n".join(lines))
+        lines = [f"• {admin_id} — المسؤول الرئيسي (غير محدود)"]
+        for user_id in self._authorized_user_ids():
+            if user_id == admin_id:
+                continue
+            stats = self._quota_info(user_id) or {}
+            lines.append(
+                f"• {user_id}: ممنوح {stats.get('granted', 0)} | متبقي {stats.get('remaining', 0)} | "
+                f"محاولات {stats.get('attempts', 0)} | نجاح {stats.get('successes', 0)} | "
+                f"فشل {stats.get('failures', 0)} | إيقاف {stats.get('stopped', 0)}"
+            )
+        await update.effective_message.reply_text("المستخدمون وتفعيلاتهم:\n" + "\n".join(lines)[-3800:])
+
+    async def _userstats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_admin(update):
+            await self._deny(update)
+            return
+        user_id = self._parse_user_id(context.args)
+        if user_id is None:
+            await update.effective_message.reply_text("الاستخدام: /userstats 123456789")
+            return
+        stats = self._quota_info(user_id)
+        if stats is None:
+            await update.effective_message.reply_text("لا توجد سجلات لهذا المستخدم حتى الآن.")
+            return
+        history = self._activation_history(user_id)
+        lines = [
+            f"تقرير المستخدم {user_id}",
+            f"ممنوح تراكميًا: {stats['granted']}",
+            f"المتبقي: {stats['remaining']}",
+            f"المحاولات التي بدأت: {stats['attempts']}",
+            f"ناجح: {stats['successes']} | فاشل: {stats['failures']} | متوقف: {stats['stopped']}",
+            "آخر المحاولات:",
+        ]
+        lines.extend(
+            f"• الهدف {target:,} — {status} — بدأ {started_at}"
+            + (f" — انتهى {finished_at}" if finished_at else "")
+            for target, status, started_at, finished_at in history
+        )
+        await update.effective_message.reply_text("\n".join(lines)[-3800:])
+
+    def _has_activation(self, update: Update) -> bool:
+        if self._is_admin(update):
+            return True
+        stats = self._quota_info(update.effective_user.id)
+        return stats is not None and stats["remaining"] > 0
 
     async def _run_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
@@ -426,6 +614,9 @@ class TelegramControlBot:
             return ConversationHandler.END
         if self._runner.is_running():
             await update.effective_message.reply_text("فيه تشغيل قائم بالفعل. اختار الحالة أو أوقفه قبل تشغيل جديد.")
+            return ConversationHandler.END
+        if not self._has_activation(update):
+            await update.effective_message.reply_text("رصيد تفعيلاتك انتهى؛ تواصل مع المسؤول لمنحك تفعيلات جديدة.")
             return ConversationHandler.END
         context.user_data.pop("run_draft", None)
         await update.effective_message.reply_text(
@@ -440,6 +631,9 @@ class TelegramControlBot:
             return ConversationHandler.END
         if self._runner.is_running():
             await update.effective_message.reply_text("فيه تشغيل قائم بالفعل. اختار الحالة أو أوقفه قبل تشغيل جديد.")
+            return ConversationHandler.END
+        if not self._has_activation(update):
+            await update.effective_message.reply_text("رصيد تفعيلاتك انتهى؛ تواصل مع المسؤول لمنحك تفعيلات جديدة.")
             return ConversationHandler.END
         if not context.args:
             context.user_data.pop("run_draft", None)
@@ -577,23 +771,49 @@ class TelegramControlBot:
             return ConversationHandler.END
 
         draft = context.user_data.pop("run_draft", {})
+        user_id = update.effective_user.id
+        target = None
+        activation_id = None
         try:
+            target = int(draft["target"])
+            if not self._is_admin(update):
+                activation_id = self._reserve_activation(user_id, target)
+                if activation_id is None:
+                    await query.edit_message_text("رصيد تفعيلاتك انتهى أو لم يعد متاحًا؛ تواصل مع المسؤول.")
+                    return ConversationHandler.END
             started = self._runner.start(
                 draft["owner_email"],
                 draft["owner_password"],
                 draft["child_email"],
                 draft["child_password"],
-                int(draft["target"]),
+                target,
+                request_user_id=user_id,
+                activation_id=activation_id,
             )
         except (KeyError, TypeError, ValueError):
+            if activation_id is not None:
+                self._refund_activation(activation_id)
             await query.edit_message_text("انتهت بيانات الطلب أو لم تكتمل. ابدأ من جديد باستخدام /run.")
+            return ConversationHandler.END
+        except Exception:
+            if activation_id is not None:
+                self._refund_activation(activation_id)
+            await query.edit_message_text("تعذر بدء التشغيل؛ لم يُخصم التفعيل. حاول لاحقًا أو أبلغ المسؤول.")
             return ConversationHandler.END
         if started:
             with self._lock:
-                self._active_user_id = update.effective_user.id
-            await query.edit_message_text("✅ بدأ التشغيل. استخدم /status للمتابعة و/stop للإيقاف.")
+                self._active_user_id = user_id
+            remaining = self._quota_info(user_id)
+            suffix = (
+                f" المتبقي: {remaining['remaining']} تفعيل."
+                if activation_id is not None and remaining is not None
+                else ""
+            )
+            await query.edit_message_text("✅ بدأ التشغيل." + suffix + " استخدم /status للمتابعة و/stop للإيقاف.")
         else:
-            await query.edit_message_text("يوجد تشغيل قائم بالفعل؛ لم أبدأ تشغيلًا آخر.")
+            if activation_id is not None:
+                self._refund_activation(activation_id)
+            await query.edit_message_text("يوجد تشغيل قائم بالفعل؛ لم أبدأ تشغيلًا آخر ولم أستهلك التفعيل.")
         return ConversationHandler.END
 
     async def _cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -647,4 +867,6 @@ class TelegramControlBot:
             await update.effective_message.reply_text("لا يوجد تشغيل حاليًا.")
             return
         self._runner.stop()
-        await update.effective_message.reply_text("⏹ وصل طلب الإيقاف؛ سيتوقف بعد انتهاء طلب الشبكة الحالي.")
+        await update.effective_message.reply_text(
+            "⏹ وصل الإيقاف؛ سيُنهي الطلب الجاري، ثم يحاول تحويل رصيد الفرد المتاح للأونر مرة واحدة قبل التوقف."
+        )

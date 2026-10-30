@@ -314,14 +314,20 @@ class AutoLoop:
         self.target_mix = target_mix
         self.cycle_count = 0
         self.stopped = False
+        self.stop_requested = False
+        self.outcome = "failed"
+        self._stop_child_transfer_attempted = False
+        self._stop_child_transfer_accepted = False
+        self._stop_child_transfer_amount = 0
 
     def stop(self):
-        self.stopped = True
+        """Request a safe stop; final child-to-owner cleanup runs before exit."""
+        self.stop_requested = True
 
     def _sleep(self, seconds):
-        """نوم قابل للإيقاف مع دعم فواصل فحص أقل من ثانية."""
+        """Interruptible sleep used between operations and during retry backoff."""
         deadline = time.monotonic() + max(0.0, float(seconds))
-        while not self.stopped:
+        while not self.stopped and not self.stop_requested:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return True
@@ -330,7 +336,7 @@ class AutoLoop:
 
     def _read_status(self, api, purpose):
         return read_status_until_available(
-            api, lambda: self.stopped, log_info, purpose
+            api, lambda: self.stopped or self.stop_requested, log_info, purpose
         )
 
     def _read_initial_status(self):
@@ -339,7 +345,7 @@ class AutoLoop:
     def _read_child_number(self):
         """Require a child number, not just a successful status request, before operations."""
         readable_misses = 0
-        while not self.stopped:
+        while not self.stopped and not self.stop_requested:
             status = self._read_status(self.owner, "بيانات الفرد")
             if status is None:
                 return None
@@ -362,7 +368,7 @@ class AutoLoop:
     def _wait_for_plan(self, expected_plan_id):
         """Poll rapidly first, then keep checking until exact confirmation or manual stop."""
         attempt = 0
-        while not self.stopped:
+        while not self.stopped and not self.stop_requested:
             if attempt < 10:
                 pause, mode = 0.25, "سريع"
             elif attempt < 20:
@@ -373,7 +379,7 @@ class AutoLoop:
             if not self._sleep(pause):
                 return False
             status = self._read_status(self.owner, f"تأكيد النظام {expected_plan_id}")
-            if status is None or self.stopped:
+            if status is None or self.stopped or self.stop_requested:
                 return False
             current_plan = status[0]
             if current_plan == expected_plan_id:
@@ -392,11 +398,85 @@ class AutoLoop:
         try:
             self._run()
         except KeyboardInterrupt:
-            log_warn("\nتم الإيقاف بواسطة المستخدم (Ctrl+C)")
+            self.stop_requested = True
+            log_warn("\nتم طلب الإيقاف؛ سأحاول تحويل رصيد الفرد المتاح للأونر قبل الخروج.")
         except Exception as e:
             log_err(f"خطأ غير متوقع: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            if self.stop_requested:
+                try:
+                    self._cleanup_after_stop()
+                except Exception as e:
+                    log_warn(f"تعذر إكمال تحويل الإيقاف: {e}")
+                self.outcome = "stopped"
+            self.stopped = True
+
+    def _cleanup_after_stop(self):
+        """Make one bounded attempt to sweep the currently available child balance to the owner."""
+        log_warn("جارٍ الإيقاف الآمن: لن أبدأ تجديدًا أو تغيير نظام جديد.")
+        if self._stop_child_transfer_attempted:
+            if self._stop_child_transfer_accepted:
+                log_ok(
+                    f"طلب تحويل الفرد للأونر ({self._stop_child_transfer_amount:,} ميكس) قُبل بالفعل؛ "
+                    "لن أعيده أو أنتظر رصيد الإرجاع."
+                )
+                return
+            verification = self.child.get_status_and_child(timeout=(2, 4))
+            if verification[0] is not None:
+                balance = max(0, int(verification[1] or 0))
+                if balance < self._stop_child_transfer_amount:
+                    log_ok(f"تغير رصيد الفرد إلى {balance:,} بعد طلب التحويل؛ لن أكرر الطلب.")
+                else:
+                    log_warn("طلب تحويل الفرد السابق غير مؤكد؛ لن أكرره لتجنب تحويل مزدوج.")
+            else:
+                log_warn("تعذر تأكيد طلب تحويل الفرد السابق؛ لن أعيده لتجنب تحويل مزدوج.")
+            return
+        if not getattr(self.owner, "current_dial", None):
+            log_warn("لا يمكن تنفيذ تحويل الإيقاف لأن رقم الأونر غير متاح.")
+            return
+
+        status = None
+        for attempt in range(3):
+            status = self.child.get_status_and_child(timeout=(2, 4))
+            if status[0] is not None:
+                break
+            if attempt < 2:
+                log_info(f"قراءة رصيد الفرد للإيقاف لم تنجح؛ إعادة محدودة {attempt + 1}/2.")
+                time.sleep(0.4 * (attempt + 1))
+
+        if status is None or status[0] is None:
+            log_warn("لم أستطع قراءة رصيد الفرد بعد 3 محاولات؛ أوقفت التشغيل دون إعادة أي طلب تحويل.")
+            return
+
+        child_balance = max(0, int(status[1] or 0))
+        if child_balance == 0:
+            log_info("رصيد الفرد الحالي صفر؛ لن أنتظر ظهور 800 أو 1300 ميكس لاحقًا.")
+            return
+
+        log_info(
+            f"محاولة أخيرة واحدة لتحويل كامل الرصيد المتاح حاليًا ({child_balance:,} ميكس) من الفرد للأونر."
+        )
+        accepted = self.child.transfer_mix(
+            self.owner.current_dial,
+            child_balance,
+            "Hekaya_XRP_MIX_Child_1",
+        )
+        if accepted:
+            log_ok(
+                f"اتصالات أكدت طلب تحويل {child_balance:,} ميكس للأونر؛ لن أنتظر رجوع رصيد 800/1300."
+            )
+            return
+
+        # A timeout/unclear response must be checked before any possible retry; never resend blindly.
+        verification = self.child.get_status_and_child(timeout=(2, 4))
+        if verification[0] is not None and int(verification[1] or 0) < child_balance:
+            log_ok(
+                f"تغير رصيد الفرد من {child_balance:,} إلى {max(0, int(verification[1] or 0)):,} بعد طلب التحويل؛ لن أعيد إرساله."
+            )
+        else:
+            log_warn("رد تحويل الإيقاف غير مؤكد؛ لم أعد إرسال التحويل لتجنب تكراره.")
 
     def _run(self):
         # ---- فحص نظام الأونر ----
@@ -404,7 +484,7 @@ class AutoLoop:
         initial = getattr(self, "initial_status", None)
         if initial is None:
             initial = self._read_initial_status()
-        if initial is None or self.stopped:
+        if initial is None or self.stopped or self.stop_requested:
             return
         plan_id, initial_mix, _ = initial
         if not plan_id:
@@ -427,6 +507,8 @@ class AutoLoop:
             log_err(f"النظام الحالي غير معروف ({plan_id})؛ أوقفت التشغيل قبل العمليات")
             return
         if "Parent_7" not in plan_id:
+            if self.stop_requested:
+                return
             target_plan = "Hekaya_XRP_MIX_Parent_7"
             log_info(f"النظام الحالي: {plan_id} → جارٍ الترقية إلى 270")
             if not self.owner.change_plan(target_plan):
@@ -434,12 +516,12 @@ class AutoLoop:
             if not self._wait_for_plan(target_plan):
                 return
 
-        if self.stopped:
+        if self.stopped or self.stop_requested:
             return
 
         # ---- التحقق من الفرد ----
         child_num = self._read_child_number()
-        if self.stopped:
+        if self.stopped or self.stop_requested:
             return
         if not child_num:
             log_err("لم يظهر فرد مضاف في ثلاث قراءات ناجحة؛ لم أبدأ أي تجديد أو تحويل")
@@ -450,13 +532,13 @@ class AutoLoop:
         print()
 
         # ---- الحلقة الرئيسية ----
-        while not self.stopped:
+        while not self.stopped and not self.stop_requested:
             self.cycle_count += 1
             print(f"{C.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.RESET}")
             log(f"🔄 الدورة رقم {self.cycle_count}", C.BOLD + C.CYAN)
 
             status = self._read_status(self.owner, "حالة الدورة الحالية")
-            if status is None or self.stopped:
+            if status is None or self.stopped or self.stop_requested:
                 return
             plan_id, mix_amount, child_num = status
             if child_num:
@@ -489,9 +571,12 @@ class AutoLoop:
                 log_ok(f"   الميكس المحقق: {mix_amount:,}")
                 log_ok(f"   عدد الدورات: {self.cycle_count}")
                 log_ok("=" * 50)
+                self.outcome = "success"
                 return
 
             # ---- تجديد الباقة ----
+            if self.stop_requested:
+                return
             log_info(f"تجديد الباقة ({name})...")
             if not self.owner.renew_bundle_action(plan_id, price):
                 log_warn("فشل التجديد")
@@ -500,10 +585,12 @@ class AutoLoop:
 
             # ---- تحويل الميكس للفرد ----
             status = self._read_status(self.owner, "رصيد الميكس بعد التجديد")
-            if status is None or self.stopped:
+            if status is None or self.stopped or self.stop_requested:
                 return
             _, new_mix, _ = status
             if new_mix > 0:
+                if self.stop_requested:
+                    return
                 log_info(f"تحويل {new_mix:,} ميكس للفرد {child_num}...")
                 if not self.owner.transfer_mix(child_num, new_mix, plan_id):
                     log_warn("فشل التحويل، انتظار 10 ثواني...")
@@ -516,7 +603,7 @@ class AutoLoop:
                 if not self._sleep(5):
                     return
                 status = self._read_status(self.child, "رصيد الفرد")
-                if status is None or self.stopped:
+                if status is None or self.stopped or self.stop_requested:
                     return
                 _, child_mix, _ = status
                 if child_mix <= 0:
@@ -538,6 +625,8 @@ class AutoLoop:
                 log_err(f"النظام غير مدعوم للتبديل ({plan_id})؛ أوقفت التشغيل")
                 return
 
+            if self.stop_requested:
+                return
             log_info(f"تغيير النظام إلى {target_plan}...")
             if not self.owner.change_plan(target_plan, target_pid):
                 log_warn("رد تغيير النظام غير مؤكد؛ سأفحص الحالة دون إعادة إرسال الطلب")
@@ -550,12 +639,23 @@ class AutoLoop:
             # ---- ترحيل ميكسات الفرد ----
             log_info("ترحيل ميكسات الفرد للأونر...")
             status = self._read_status(self.child, "رصيد الفرد بعد تغيير النظام")
-            if status is None or self.stopped:
+            if status is None or self.stopped or self.stop_requested:
                 return
             _, child_mix, _ = status
             if child_mix > 0:
-                if self.child.transfer_mix(self.owner.current_dial, child_mix,
-                                           "Hekaya_XRP_MIX_Child_1"):
+                if self.stop_requested:
+                    return
+                transfer_accepted = self.child.transfer_mix(
+                    self.owner.current_dial,
+                    child_mix,
+                    "Hekaya_XRP_MIX_Child_1",
+                )
+                if self.stop_requested:
+                    self._stop_child_transfer_attempted = True
+                    self._stop_child_transfer_accepted = transfer_accepted
+                    self._stop_child_transfer_amount = child_mix
+                    return
+                if transfer_accepted:
                     log_ok(f"تم ترحيل {child_mix:,} ميكس")
                 else:
                     log_warn("فشل الترحيل")

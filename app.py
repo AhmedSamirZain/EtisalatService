@@ -38,6 +38,11 @@ class BackgroundRunner:
         self._loop = None
         self._stop_requested = False
         self._error = None
+        self._completion_callback = None
+        self._last_outcome = None
+
+    def set_completion_callback(self, callback):
+        self._completion_callback = callback
 
     def is_running(self):
         return self._thread is not None and self._thread.is_alive()
@@ -50,7 +55,16 @@ class BackgroundRunner:
         with self._lock:
             return list(self._logs), self._error
 
-    def start(self, owner_email, owner_password, child_email, child_password, target):
+    def start(
+        self,
+        owner_email,
+        owner_password,
+        child_email,
+        child_password,
+        target,
+        request_user_id=None,
+        activation_id=None,
+    ):
         bot = self._bot_module
         with self._lock:
             if self.is_running():
@@ -59,9 +73,19 @@ class BackgroundRunner:
             self._error = None
             self._stop_requested = False
             self._loop = None
+            self._last_outcome = None
             self._thread = threading.Thread(
                 target=self._run,
-                args=(bot, owner_email, owner_password, child_email, child_password, target),
+                args=(
+                    bot,
+                    owner_email,
+                    owner_password,
+                    child_email,
+                    child_password,
+                    target,
+                    request_user_id,
+                    activation_id,
+                ),
                 name="etisalat-auto-loop",
                 daemon=True,
             )
@@ -73,10 +97,21 @@ class BackgroundRunner:
             self._stop_requested = True
             if self._loop is not None:
                 self._loop.stop()
-            self.add_log("⏹ طُلب إيقاف التشغيل؛ سيقف بعد انتهاء طلب الشبكة الحالي.")
+            self.add_log("⏹ طُلب الإيقاف؛ سيُنهي طلب الشبكة الحالي ثم يحاول تحويل رصيد الفرد المتاح للأونر مرة واحدة.")
 
-    def _run(self, bot, owner_email, owner_password, child_email, child_password, target):
+    def _run(
+        self,
+        bot,
+        owner_email,
+        owner_password,
+        child_email,
+        child_password,
+        target,
+        request_user_id=None,
+        activation_id=None,
+    ):
         bot.LOG_SINK = self.add_log
+        outcome = "failed"
         try:
             self.add_log("بدء تسجيل الدخول إلى حساب الأونر...")
             owner = bot.EtisalatAPI()
@@ -85,6 +120,7 @@ class BackgroundRunner:
             self.add_log("تم تسجيل دخول الأونر.")
 
             if self._stop_requested:
+                outcome = "stopped"
                 return
 
             self.add_log("بدء تسجيل الدخول إلى حساب الفرد...")
@@ -94,6 +130,7 @@ class BackgroundRunner:
             self.add_log("تم تسجيل دخول الفرد.")
 
             if self._stop_requested:
+                outcome = "stopped"
                 return
 
             self.add_log("قراءة النظام والرصيد قبل بدء أي تجديد أو تحويل...")
@@ -104,6 +141,7 @@ class BackgroundRunner:
                 "النظام والرصيد الحاليين",
             )
             if self._stop_requested:
+                outcome = "stopped"
                 return
             plan_id, initial_mix, _ = initial_status
             if not plan_id:
@@ -128,8 +166,10 @@ class BackgroundRunner:
                 if self._stop_requested:
                     loop.stop()
             loop.run()
+            outcome = getattr(loop, "outcome", "failed")
             self.add_log("انتهى تشغيل الدورة.")
         except Exception as exc:
+            outcome = "stopped" if self._stop_requested else "failed"
             with self._lock:
                 self._error = str(exc)
             self.add_log(f"❌ خطأ أثناء التشغيل: {exc}")
@@ -137,6 +177,13 @@ class BackgroundRunner:
             bot.LOG_SINK = None
             with self._lock:
                 self._loop = None
+                self._last_outcome = outcome
+                completion_callback = self._completion_callback
+            if activation_id is not None and completion_callback is not None:
+                try:
+                    completion_callback(request_user_id, activation_id, outcome)
+                except Exception as exc:
+                    self.add_log(f"تعذر تسجيل نتيجة التفعيل: {exc}")
 
 
 @st.cache_resource
@@ -202,7 +249,7 @@ st.warning(
     "إدارة المستخدمين متاحة فقط للمسؤول المحدد في ADMIN_ID. المستخدمون المضافون يمكنهم التشغيل من محادثة خاصة، "
     "لكن تشغيلًا واحدًا فقط مسموح به في كل مرة. التشغيل قد يجدد باقات ويحوّل ميكسات، وهذه عمليات فعلية."
 )
-st.info("في Telegram: أرسل /start. للمسؤول استخدم /admin لإضافة المستخدمين وإدارتهم؛ لبدء دورة استخدم /run 50000.")
+st.info("في Telegram: أرسل /start. للمسؤول: /admin ثم /adduser ID و/grant ID العدد لإدارة التفعيلات؛ لبدء دورة استخدم /run 50000.")
 st.caption(
     "استضافة Streamlit قد تنام أو تعيد التشغيل؛ عندها يتوقف البوت والدورة. "
     "للتشغيل الدائم 24/7 استخدم استضافة عامل تعمل باستمرار."
