@@ -316,6 +316,43 @@ class AutoLoop:
                 break
         return (None, 0, None)
 
+    def _read_child_number(self):
+        """Retry transient status failures and require repeated readable misses before stopping."""
+        attempt = 0
+        readable_misses = 0
+        while not self.stopped:
+            if attempt < 6:
+                pause, timeout, mode = 0.25, (2, 3), "سريع"
+            elif attempt < 12:
+                pause, timeout, mode = 0.75, (3, 5), "متوسط"
+            else:
+                pause, timeout, mode = 2.0, (3, 10), "مستمر"
+
+            plan_id, _, child_number = self.owner.get_status_and_child(timeout=timeout)
+            if self.stopped:
+                return None
+            if child_number:
+                log_ok(f"تم تأكيد الفرد: {child_number}")
+                return child_number
+
+            if plan_id and plan_id != "Unknown":
+                readable_misses += 1
+                if readable_misses >= 3:
+                    return None
+            else:
+                # A timeout, invalid response, or unparseable plan is not proof that no child exists.
+                readable_misses = 0
+
+            attempt += 1
+            if attempt == 1 or attempt % 5 == 0:
+                log_info(
+                    f"لم تظهر بيانات الفرد بعد ({attempt} محاولة؛ {readable_misses}/3 قراءات ناجحة بلا فرد). "
+                    "لن أبدأ التجديد أو التحويل قبل تأكيده."
+                )
+            if not self._sleep(pause):
+                return None
+        return None
+
     def _wait_for_plan(self, expected_plan_id):
         """Poll rapidly first, then keep checking until exact confirmation or manual stop."""
         attempt = 0
@@ -394,12 +431,14 @@ class AutoLoop:
             return
 
         # ---- التحقق من الفرد ----
-        _, _, child_num = self.owner.get_status_and_child(timeout=(2, 3))
-        if not child_num:
-            log_err("لا يوجد فرد مضاف — أضف فرداً أولاً")
+        child_num = self._read_child_number()
+        if self.stopped:
             return
+        if not child_num:
+            log_err("لم يظهر فرد مضاف في ثلاث قراءات ناجحة؛ لم أبدأ أي تجديد أو تحويل")
+            return
+        self.child_num = child_num
 
-        log_ok(f"الفرد: {child_num}")
         log_info(f"الهدف: {self.target_mix:,} ميكس")
         print()
 
@@ -417,6 +456,11 @@ class AutoLoop:
                 if not self._sleep(5):
                     return
                 continue
+            if child_num:
+                self.child_num = child_num
+            else:
+                # Keep using the member already confirmed; a partial status response is not proof of removal.
+                child_num = getattr(self, "child_num", None)
             if plan_id not in PLAN_IDS:
                 log_err(f"معرّف النظام غير معروف ({plan_id})؛ أوقفت الدورة قبل التجديد أو التحويل")
                 return
