@@ -22,7 +22,7 @@ Do not put account emails/passwords or the bot token in GitHub. The repository i
 
 After `/start`, use the persistent buttons **تشغيل**, **الحالة**, **إيقاف**, **إلغاء**, **مساعدة**, and **البداية**. The run button asks for a target, shows a safety confirmation, collects the owner/child credentials for that run, and asks for a final confirmation. Text commands are also supported: `/run 50000`, `/status`, `/stop`, `/cancel`, and `/help`. Targets are limited to 1–1,000,000 mixes.
 
-Before any automation action, the app reads and logs the current plan and the next plan in the existing 180/270 sequence. Plan-status requests use shorter connect/read timeouts and a quarter-second pause between migration checks; if the Etisalat server itself is slow or unreachable, faster polling cannot make it respond, and the bot may report timeouts.
+Before any automation action, the app reads and logs the current plan and the next plan in the existing 180/270 sequence. The initial read allows 10 seconds for the response and retries once; if it still cannot read the plan, the run stops before account operations. After a plan-change request, it requires an exact match for the requested plan ID: six fast checks (250ms pause, 2s connect/3s read timeout), then two slower checks (1s pause, 3s connect/10s read timeout). If the exact plan is not confirmed, it stops instead of continuing to the next operation. Polling cannot make an unresponsive Etisalat endpoint respond faster.
 
 Only private messages from the Telegram account whose numeric user ID matches `ADMIN_ID` are authorized. Do not run another polling instance with the same token.
 

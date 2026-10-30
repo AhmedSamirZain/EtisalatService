@@ -293,6 +293,26 @@ class AutoLoop:
             time.sleep(min(0.1, remaining))
         return False
 
+    def _wait_for_plan(self, expected_plan_id):
+        """Poll quickly, then allow a few longer server responses; require an exact match."""
+        fast_attempts = 6
+        slow_attempts = 2
+        total = fast_attempts + slow_attempts
+        for attempt in range(total):
+            if self.stopped:
+                return False
+            fast = attempt < fast_attempts
+            if not self._sleep(0.25 if fast else 1.0):
+                return False
+            timeout = (2, 3) if fast else (3, 10)
+            current_plan, _, _ = self.owner.get_status_and_child(timeout=timeout)
+            if current_plan == expected_plan_id:
+                log_ok(f"تم تأكيد النظام المطلوب: {current_plan}")
+                return True
+            log_info(f"فحص النظام بعد التغيير: {attempt + 1}/{total}")
+        log_err(f"لم يتم تأكيد النظام المطلوب {expected_plan_id}؛ لن أكمل إلى عملية أخرى")
+        return False
+
     def run(self):
         try:
             self._run()
@@ -328,16 +348,17 @@ class AutoLoop:
         log_info(f"النظام التالي حسب الحالة الحالية: {next_name}")
 
         # ---- ترقية النظام ----
-        if plan_id and "Parent_7" not in plan_id:
+        if plan_id not in PLAN_IDS:
+            log_err(f"النظام الحالي غير معروف ({plan_id})؛ أوقفت التشغيل قبل العمليات")
+            return
+        if "Parent_7" not in plan_id:
+            target_plan = "Hekaya_XRP_MIX_Parent_7"
             log_info(f"النظام الحالي: {plan_id} → جارٍ الترقية إلى 270")
-            self.owner.change_plan("Hekaya_XRP_MIX_Parent_7")
-            for _ in range(30):
-                if not self._sleep(0.25):
-                    return
-                pid, _, _ = self.owner.get_status_and_child(timeout=(2, 3))
-                if pid and "Parent_7" in pid:
-                    log_ok("تم الترقية بنجاح")
-                    break
+            if not self.owner.change_plan(target_plan):
+                log_err("طلب الترقية إلى 270 لم يُقبل؛ أوقفت التشغيل")
+                return
+            if not self._wait_for_plan(target_plan):
+                return
 
         if self.stopped:
             return
@@ -423,42 +444,25 @@ class AutoLoop:
                 return
 
             # ---- تغيير النظام ----
-            last_plan = plan_id
-            if "7" in plan_id:
+            if plan_id == "Hekaya_XRP_MIX_Parent_7":
                 target_plan = "Hekaya_XRP_MIX_Parent_6"
-                target_pid  = "951"
-            else:
+                target_pid = "951"
+            elif plan_id == "Hekaya_XRP_MIX_Parent_6":
                 target_plan = "Hekaya_XRP_MIX_Parent_7"
-                target_pid  = ""
+                target_pid = ""
+            else:
+                log_err(f"النظام غير مدعوم للتبديل ({plan_id})؛ أوقفت التشغيل")
+                return
 
             log_info(f"تغيير النظام إلى {target_plan}...")
             if not self.owner.change_plan(target_plan, target_pid):
-                log_warn("فشل التغيير، انتظار 10 ثواني...")
-                if not self._sleep(10):
-                    return
-                continue
-
-            # ---- انتظار التغيير ----
-            log_info("مراقبة تغيير النظام...")
-            detected = False
-            for i in range(90):
-                if not self._sleep(0.25):
-                    return
-                cur_pid, _, _ = self.owner.get_status_and_child(timeout=(2, 3))
-                if cur_pid and cur_pid != last_plan:
-                    detected = True
-                    log_ok(f"تم التغيير إلى {cur_pid}")
-                    break
-                if i % 10 == 0 and i > 0:
-                    log(f"  فحص تغيير النظام: المحاولة {i+1}/90", C.GRAY)
-
-            if self.stopped:
+                log_err("طلب تغيير النظام لم يُقبل؛ أوقفت التشغيل بدل بدء دورة أخرى")
                 return
-            if not detected:
-                log_warn("لم يتم اكتشاف التغيير، انتظار 10 ثواني...")
-                if not self._sleep(10):
-                    return
-                continue
+
+            # لا نكمل النقل أو الدورة التالية إلا بعد ظهور المعرّف المطلوب بالضبط.
+            log_info(f"فحص سريع لتأكيد الوصول إلى {target_plan}...")
+            if not self._wait_for_plan(target_plan):
+                return
 
             # ---- ترحيل ميكسات الفرد ----
             log_info("ترحيل ميكسات الفرد للأونر...")
