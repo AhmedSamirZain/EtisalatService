@@ -39,10 +39,23 @@ class BackgroundRunner:
         self._stop_requested = False
         self._error = None
         self._completion_callback = None
+        self._plan_retry_settings_provider = None
         self._last_outcome = None
+        self._live_state = {"phase": "idle"}
 
     def set_completion_callback(self, callback):
         self._completion_callback = callback
+
+    def set_plan_retry_settings_provider(self, provider):
+        self._plan_retry_settings_provider = provider
+
+    def _set_live_state(self, state):
+        with self._lock:
+            self._live_state = dict(state)
+
+    def live_state(self):
+        with self._lock:
+            return dict(self._live_state)
 
     def is_running(self):
         return self._thread is not None and self._thread.is_alive()
@@ -74,6 +87,7 @@ class BackgroundRunner:
             self._stop_requested = False
             self._loop = None
             self._last_outcome = None
+            self._live_state = {"phase": "starting", "status": "تجهيز التشغيل"}
             self._thread = threading.Thread(
                 target=self._run,
                 args=(
@@ -97,6 +111,12 @@ class BackgroundRunner:
             self._stop_requested = True
             if self._loop is not None:
                 self._loop.stop()
+            else:
+                self._live_state = {
+                    **self._live_state,
+                    "phase": "stopping",
+                    "status": "وصل طلب الإيقاف؛ أنتظر انتهاء الطلب الحالي",
+                }
             self.add_log("⏹ طُلب الإيقاف؛ سيُنهي طلب الشبكة الحالي ثم يحاول تحويل رصيد الفرد المتاح للأونر مرة واحدة.")
 
     def _run(
@@ -113,6 +133,7 @@ class BackgroundRunner:
         bot.LOG_SINK = self.add_log
         outcome = "failed"
         try:
+            self._set_live_state({"phase": "login_owner", "status": "تسجيل دخول الأونر"})
             self.add_log("بدء تسجيل الدخول إلى حساب الأونر...")
             owner = bot.EtisalatAPI()
             if not owner.login(owner_email, owner_password):
@@ -123,6 +144,7 @@ class BackgroundRunner:
                 outcome = "stopped"
                 return
 
+            self._set_live_state({"phase": "login_child", "status": "تسجيل دخول الفرد"})
             self.add_log("بدء تسجيل الدخول إلى حساب الفرد...")
             child = bot.EtisalatAPI()
             if not child.login(child_email, child_password):
@@ -133,6 +155,7 @@ class BackgroundRunner:
                 outcome = "stopped"
                 return
 
+            self._set_live_state({"phase": "initial_status", "status": "قراءة النظام والرصيد"})
             self.add_log("قراءة النظام والرصيد قبل بدء أي تجديد أو تحويل...")
             initial_status = bot.read_status_until_available(
                 owner,
@@ -156,8 +179,21 @@ class BackgroundRunner:
             self.add_log(f"النظام عند البداية: {plan_name}")
             self.add_log(f"الرصيد عند البداية: {initial_mix:,} ميكس")
             self.add_log(f"النظام التالي حسب الحالة الحالية: {next_plan_name}")
+            self._set_live_state({
+                "phase": "starting_loop",
+                "status": "بدء الدورة",
+                "current_plan_id": plan_id,
+                "current_plan_name": plan_name,
+                "target_mix": target,
+            })
 
-            loop = bot.AutoLoop(owner, child, target)
+            loop = bot.AutoLoop(
+                owner,
+                child,
+                target,
+                retry_settings_provider=self._plan_retry_settings_provider,
+                status_callback=self._set_live_state,
+            )
             loop.initial_status = initial_status
             loop.owner_email = owner_email
             loop.owner_pass = owner_password
@@ -178,6 +214,15 @@ class BackgroundRunner:
             with self._lock:
                 self._loop = None
                 self._last_outcome = outcome
+                self._live_state = {
+                    "phase": outcome,
+                    "status": {
+                        "success": "اكتمل التشغيل بنجاح",
+                        "failed": "انتهى التشغيل بفشل",
+                        "stopped": "تم إيقاف التشغيل",
+                    }.get(outcome, "انتهى التشغيل"),
+                    "outcome": outcome,
+                }
                 completion_callback = self._completion_callback
             if activation_id is not None and completion_callback is not None:
                 try:
@@ -249,7 +294,7 @@ st.warning(
     "إدارة المستخدمين متاحة فقط للمسؤول المحدد في ADMIN_ID. المستخدمون المضافون يمكنهم التشغيل من محادثة خاصة، "
     "لكن تشغيلًا واحدًا فقط مسموح به في كل مرة. التشغيل قد يجدد باقات ويحوّل ميكسات، وهذه عمليات فعلية."
 )
-st.info("في Telegram: أرسل /start. للمسؤول: /admin ثم /adduser ID و/grant ID العدد لإدارة التفعيلات؛ لبدء دورة استخدم /run 50000.")
+st.info("في Telegram: أرسل /start. للمسؤول: /admin و/settings لإدارة المستخدمين والتفعيلات ومهلة تغيير النظام وتحديث الحالة؛ لبدء دورة استخدم /run 50000.")
 st.caption(
     "استضافة Streamlit قد تنام أو تعيد التشغيل؛ عندها يتوقف البوت والدورة. "
     "للتشغيل الدائم 24/7 استخدم استضافة عامل تعمل باستمرار."
