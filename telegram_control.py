@@ -44,10 +44,18 @@ BUTTON_ADMIN = "👥 لوحة الإدارة"
 DEFAULT_BOT_SETTINGS = {
     "plan_retry_minutes": 4,
     "plan_retry_limit": 3,
+    "transfer_retry_seconds": 3,
+    "transfer_retry_limit": 3,
+    "migration_settle_seconds": 60,
+    "post_transfer_wait_seconds": 3,
     "status_refresh_seconds": 5,
 }
 PLAN_RETRY_MINUTE_OPTIONS = (1, 2, 3, 4, 5, 10, 15)
 PLAN_RETRY_LIMIT_OPTIONS = (1, 3, 5, 10, 0)  # 0 means unlimited retries.
+TRANSFER_RETRY_SECOND_OPTIONS = (3, 5, 10, 20, 30, 60)
+TRANSFER_RETRY_LIMIT_OPTIONS = (1, 3, 5, 10, 0)  # 0 means unlimited retries.
+MIGRATION_SETTLE_OPTIONS = (0, 30, 60, 90, 120)
+POST_TRANSFER_WAIT_OPTIONS = (0, 1, 3, 5, 10)
 STATUS_REFRESH_OPTIONS = (3, 5, 10, 15)
 
 
@@ -141,12 +149,20 @@ class TelegramControlBot:
         return {
             "plan_retry_seconds": settings["plan_retry_minutes"] * 60,
             "plan_retry_limit": settings["plan_retry_limit"],
+            "transfer_retry_seconds": settings["transfer_retry_seconds"],
+            "transfer_retry_limit": settings["transfer_retry_limit"],
+            "migration_settle_seconds": settings["migration_settle_seconds"],
+            "post_transfer_wait_seconds": settings["post_transfer_wait_seconds"],
         }
 
     def _set_bot_setting(self, key: str, value: int) -> bool:
         allowed = {
             "plan_retry_minutes": PLAN_RETRY_MINUTE_OPTIONS,
             "plan_retry_limit": PLAN_RETRY_LIMIT_OPTIONS,
+            "transfer_retry_seconds": TRANSFER_RETRY_SECOND_OPTIONS,
+            "transfer_retry_limit": TRANSFER_RETRY_LIMIT_OPTIONS,
+            "migration_settle_seconds": MIGRATION_SETTLE_OPTIONS,
+            "post_transfer_wait_seconds": POST_TRANSFER_WAIT_OPTIONS,
             "status_refresh_seconds": STATUS_REFRESH_OPTIONS,
         }
         if key not in allowed or value not in allowed[key]:
@@ -335,7 +351,7 @@ class TelegramControlBot:
         application.add_handler(CommandHandler("settings", self._settings_command))
         application.add_handler(MessageHandler(filters.Regex(r"^👥 لوحة الإدارة$"), self._admin_panel))
         application.add_handler(CallbackQueryHandler(self._admin_callback, pattern=r"^admin:(users|add_help|remove_help|grant_help|settings)$"))
-        application.add_handler(CallbackQueryHandler(self._settings_callback, pattern=r"^settings:(plan_retry_minutes|plan_retry_limit|status_refresh_seconds|noop):\d+$"))
+        application.add_handler(CallbackQueryHandler(self._settings_callback, pattern=r"^settings:(plan_retry_minutes|plan_retry_limit|transfer_retry_seconds|transfer_retry_limit|migration_settle_seconds|post_transfer_wait_seconds|status_refresh_seconds|noop):\d+$"))
         application.add_handler(CommandHandler("start", self._start_command))
         application.add_handler(CommandHandler("help", self._help_command))
         application.add_handler(MessageHandler(filters.Regex(r"^ℹ️ مساعدة$"), self._help_command))
@@ -512,29 +528,68 @@ class TelegramControlBot:
             button("10", "plan_retry_limit", 10, settings["plan_retry_limit"] == 10),
             button("بلا حد", "plan_retry_limit", 0, settings["plan_retry_limit"] == 0),
         ]]
+        transfer_interval_rows = [
+            [button(f"{seconds} ث", "transfer_retry_seconds", seconds,
+                    settings["transfer_retry_seconds"] == seconds)
+             for seconds in TRANSFER_RETRY_SECOND_OPTIONS[:3]],
+            [button(f"{seconds} ث", "transfer_retry_seconds", seconds,
+                    settings["transfer_retry_seconds"] == seconds)
+             for seconds in TRANSFER_RETRY_SECOND_OPTIONS[3:]],
+        ]
+        transfer_limit_rows = [[
+            button("1", "transfer_retry_limit", 1, settings["transfer_retry_limit"] == 1),
+            button("3", "transfer_retry_limit", 3, settings["transfer_retry_limit"] == 3),
+            button("5", "transfer_retry_limit", 5, settings["transfer_retry_limit"] == 5),
+            button("10", "transfer_retry_limit", 10, settings["transfer_retry_limit"] == 10),
+            button("بلا حد", "transfer_retry_limit", 0, settings["transfer_retry_limit"] == 0),
+        ]]
+        settle_rows = [[
+            button(f"{seconds} ث", "migration_settle_seconds", seconds,
+                    settings["migration_settle_seconds"] == seconds)
+            for seconds in MIGRATION_SETTLE_OPTIONS
+        ]]
+        post_transfer_rows = [[
+            button(f"{seconds} ث", "post_transfer_wait_seconds", seconds,
+                    settings["post_transfer_wait_seconds"] == seconds)
+            for seconds in POST_TRANSFER_WAIT_OPTIONS
+        ]]
         refresh_rows = [[
             button(f"{seconds} ث", "status_refresh_seconds", seconds, settings["status_refresh_seconds"] == seconds)
             for seconds in STATUS_REFRESH_OPTIONS
         ]]
         return InlineKeyboardMarkup(
             retry_rows
-            + [[InlineKeyboardButton("— حد الإعادات التلقائية —", callback_data="settings:noop:0")]]
+            + [[InlineKeyboardButton("— حد إعادات تغيير النظام —", callback_data="settings:noop:0")]]
             + limit_rows
+            + [[InlineKeyboardButton("— مهلة إعادة محاولة التحويل —", callback_data="settings:noop:0")]]
+            + transfer_interval_rows
+            + [[InlineKeyboardButton("— حد إعادات التحويل —", callback_data="settings:noop:0")]]
+            + transfer_limit_rows
+            + [[InlineKeyboardButton("— انتظار استقرار النظام بعد التغيير —", callback_data="settings:noop:0")]]
+            + settle_rows
+            + [[InlineKeyboardButton("— مهلة بعد نجاح التحويل —", callback_data="settings:noop:0")]]
+            + post_transfer_rows
             + [[InlineKeyboardButton("— تحديث رسالة الحالة —", callback_data="settings:noop:0")]]
             + refresh_rows
         )
 
     @staticmethod
     def _settings_text(settings):
-        limit = "بلا حد" if settings["plan_retry_limit"] == 0 else str(settings["plan_retry_limit"])
+        plan_limit = "بلا حد" if settings["plan_retry_limit"] == 0 else str(settings["plan_retry_limit"])
+        transfer_limit = "بلا حد" if settings["transfer_retry_limit"] == 0 else str(settings["transfer_retry_limit"])
         return (
             "⚙️ إعدادات التشغيل التلقائي\n\n"
             f"⏱ مهلة إعادة طلب تغيير النظام: كل {settings['plan_retry_minutes']} دقائق.\n"
-            f"🔁 أقصى إعادات تلقائية بعد الطلب الأول: {limit}.\n"
+            f"🔁 أقصى إعادات تغيير النظام بعد الطلب الأول: {plan_limit}.\n"
+            f"🔄 مهلة إعادة التحويل: كل {settings['transfer_retry_seconds']} ثوانٍ، "
+            f"وبعدد {transfer_limit} إعادات بعد المحاولة الأولى.\n"
+            f"⏳ انتظار الاستقرار بعد تغيير النظام: {settings['migration_settle_seconds']} ثانية.\n"
+            f"⏱ مهلة بعد نجاح التحويل: {settings['post_transfer_wait_seconds']} ثانية.\n"
             f"📲 تحديث رسالة الحالة: كل {settings['status_refresh_seconds']} ثوانٍ.\n\n"
-            "التغيير يُطبّق أثناء التشغيل عند دورة الفحص التالية. لن يعيد البوت طلب تغيير النظام إلا "
-            "بعد قراءة ناجحة تؤكد أن النظام القديم ما زال قائمًا. إذا تعذرت القراءة، يواصل الانتظار دون إعادة عمياء. "
-            "إعادة الطلب عملية فعلية؛ اختر حد الإعادات بحذر. عند بلوغ الحد يستمر التحقق دون طلبات إضافية."
+            "تُطبّق الإعدادات أثناء التشغيل. لا يعيد البوت طلب تغيير النظام بعد مهلة الإعداد إلا "
+            "عند قراءة ناجحة تؤكد أن النظام القديم ما زال قائمًا؛ القراءة المتعذرة تعني الانتظار. "
+            "التحويل يُراجع باستعلام الكمية القابلة للتحويل، وأي نتيجة ملتبسة لا تُكرر حتى يؤكد الاستعلام "
+            "أن الكمية نفسها ما زالت متاحة. عند بلوغ حد إعادة التحويل يستمر التحقق دون إرسال طلبات إضافية."
         )
 
     async def _settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1006,6 +1061,15 @@ class TelegramControlBot:
             text += f"\n📊 الرصيد: {state['current_mix']:,} / {state.get('target_mix', 0):,} ميكس"
         if state.get("cycle_count") is not None:
             text += f"\n🔄 الدورة: {state['cycle_count']}"
+        if state.get("transfer_retry_limit") is not None:
+            transfer_retries = int(state.get("transfer_retry_limit", 3))
+            transfer_attempts = int(state.get("transfer_attempts", 0))
+            transfer_limit_label = (
+                "بلا حد" if transfer_retries == 0 else str(transfer_retries + 1)
+            )
+            text += f"\n🔁 محاولات التحويل: {transfer_attempts}/{transfer_limit_label}"
+            if state.get("transfer_amount") is not None:
+                text += f"\n📨 الكمية المستعلم عنها: {int(state['transfer_amount']):,} ميكس"
         if target:
             text += f"\n🎯 النظام المطلوب: {self._plan_label(target)}"
             interval = max(1, int(state.get("retry_interval_seconds", 240)))
