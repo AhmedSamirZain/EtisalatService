@@ -293,6 +293,57 @@ class AutoLoop:
             time.sleep(min(0.1, remaining))
         return False
 
+    def _read_initial_status(self):
+        """Retry the read-only preflight until status is readable or manually stopped."""
+        attempt = 0
+        while not self.stopped:
+            if attempt < 6:
+                pause, timeout, mode = 0.25, (2, 3), "سريع"
+            elif attempt < 12:
+                pause, timeout, mode = 0.75, (3, 5), "متوسط"
+            else:
+                pause, timeout, mode = 2.0, (3, 10), "مستمر"
+
+            status = self.owner.get_status_and_child(timeout=timeout)
+            if status[0]:
+                log_info(f"تمت قراءة النظام بعد {attempt + 1} محاولة ({mode})")
+                return status
+
+            attempt += 1
+            if attempt == 1 or attempt % 5 == 0:
+                log_info(f"النظام لم يُقرأ بعد ({attempt} محاولة)؛ لا توجد عمليات أثناء الانتظار.")
+            if not self._sleep(pause):
+                break
+        return (None, 0, None)
+
+    def _wait_for_plan(self, expected_plan_id):
+        """Poll rapidly first, then keep checking until exact confirmation or manual stop."""
+        attempt = 0
+        while not self.stopped:
+            if attempt < 10:
+                pause, timeout, mode = 0.25, (2, 3), "سريع"
+            elif attempt < 20:
+                pause, timeout, mode = 0.75, (3, 5), "متوسط"
+            else:
+                pause, timeout, mode = 2.0, (3, 10), "مستمر"
+
+            if not self._sleep(pause):
+                return False
+            current_plan, _, _ = self.owner.get_status_and_child(timeout=timeout)
+            if self.stopped:
+                return False
+            if current_plan == expected_plan_id:
+                log_ok(f"تم تأكيد النظام المطلوب بالضبط: {current_plan}")
+                return True
+
+            attempt += 1
+            if attempt == 1 or attempt % 5 == 0:
+                log_info(
+                    f"لسه بأكد النظام المطلوب {expected_plan_id}؛ المحاولة {attempt} ({mode}). "
+                    "مش هبدأ العملية التالية قبل التأكيد."
+                )
+        return False
+
     def run(self):
         try:
             self._run()
@@ -308,7 +359,7 @@ class AutoLoop:
         log_step("فحص النظام الحالي قبل أي عملية...")
         initial = getattr(self, "initial_status", None)
         if initial is None:
-            initial = self.owner.get_status_and_child(timeout=(2, 3))
+            initial = self._read_initial_status()
         plan_id, initial_mix, _ = initial
         if self.stopped:
             return
@@ -328,16 +379,16 @@ class AutoLoop:
         log_info(f"النظام التالي حسب الحالة الحالية: {next_name}")
 
         # ---- ترقية النظام ----
-        if plan_id and "Parent_7" not in plan_id:
+        if plan_id not in PLAN_IDS:
+            log_err(f"النظام الحالي غير معروف ({plan_id})؛ أوقفت التشغيل قبل العمليات")
+            return
+        if "Parent_7" not in plan_id:
+            target_plan = "Hekaya_XRP_MIX_Parent_7"
             log_info(f"النظام الحالي: {plan_id} → جارٍ الترقية إلى 270")
-            self.owner.change_plan("Hekaya_XRP_MIX_Parent_7")
-            for _ in range(30):
-                if not self._sleep(0.25):
-                    return
-                pid, _, _ = self.owner.get_status_and_child(timeout=(2, 3))
-                if pid and "Parent_7" in pid:
-                    log_ok("تم الترقية بنجاح")
-                    break
+            if not self.owner.change_plan(target_plan):
+                log_warn("رد طلب الترقية غير مؤكد؛ سأفحص النظام دون إعادة إرسال الطلب")
+            if not self._wait_for_plan(target_plan):
+                return
 
         if self.stopped:
             return
@@ -366,6 +417,9 @@ class AutoLoop:
                 if not self._sleep(5):
                     return
                 continue
+            if plan_id not in PLAN_IDS:
+                log_err(f"معرّف النظام غير معروف ({plan_id})؛ أوقفت الدورة قبل التجديد أو التحويل")
+                return
 
             name, price = PLAN_IDS.get(plan_id, ("حكاية ميكسات 270", "270"))
             log(f"  النظام: {name}", C.GRAY)
@@ -423,42 +477,24 @@ class AutoLoop:
                 return
 
             # ---- تغيير النظام ----
-            last_plan = plan_id
-            if "7" in plan_id:
+            if plan_id == "Hekaya_XRP_MIX_Parent_7":
                 target_plan = "Hekaya_XRP_MIX_Parent_6"
-                target_pid  = "951"
-            else:
+                target_pid = "951"
+            elif plan_id == "Hekaya_XRP_MIX_Parent_6":
                 target_plan = "Hekaya_XRP_MIX_Parent_7"
-                target_pid  = ""
+                target_pid = ""
+            else:
+                log_err(f"النظام غير مدعوم للتبديل ({plan_id})؛ أوقفت التشغيل")
+                return
 
             log_info(f"تغيير النظام إلى {target_plan}...")
             if not self.owner.change_plan(target_plan, target_pid):
-                log_warn("فشل التغيير، انتظار 10 ثواني...")
-                if not self._sleep(10):
-                    return
-                continue
+                log_warn("رد تغيير النظام غير مؤكد؛ سأفحص الحالة دون إعادة إرسال الطلب")
 
-            # ---- انتظار التغيير ----
-            log_info("مراقبة تغيير النظام...")
-            detected = False
-            for i in range(90):
-                if not self._sleep(0.25):
-                    return
-                cur_pid, _, _ = self.owner.get_status_and_child(timeout=(2, 3))
-                if cur_pid and cur_pid != last_plan:
-                    detected = True
-                    log_ok(f"تم التغيير إلى {cur_pid}")
-                    break
-                if i % 10 == 0 and i > 0:
-                    log(f"  فحص تغيير النظام: المحاولة {i+1}/90", C.GRAY)
-
-            if self.stopped:
+            # لا نكمل النقل أو الدورة التالية إلا بعد ظهور المعرّف المطلوب بالضبط.
+            log_info(f"فحص سريع لتأكيد الوصول إلى {target_plan}...")
+            if not self._wait_for_plan(target_plan):
                 return
-            if not detected:
-                log_warn("لم يتم اكتشاف التغيير، انتظار 10 ثواني...")
-                if not self._sleep(10):
-                    return
-                continue
 
             # ---- ترحيل ميكسات الفرد ----
             log_info("ترحيل ميكسات الفرد للأونر...")
