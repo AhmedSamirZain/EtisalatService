@@ -387,6 +387,9 @@ class AutoLoop:
                 if not self._sleep(5):
                     return
                 continue
+            if plan_id not in PLAN_IDS:
+                log_err(f"معرّف النظام غير معروف ({plan_id})؛ أوقفت الدورة قبل التجديد أو التحويل")
+                return
 
             name, price = PLAN_IDS.get(plan_id, ("حكاية ميكسات 270", "270"))
             log(f"  النظام: {name}", C.GRAY)
