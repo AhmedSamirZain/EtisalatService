@@ -297,9 +297,9 @@ class LegacyCycleTests(unittest.TestCase):
         self.assertTrue(loop._transfer_available_product(sender, CHILD_DIAL, "P", "P", "test"))
         self.assertEqual(sender.sent, [100, 100])
         self.assertEqual(sender.reads, [])
-        self.assertEqual(waits, [3, 4])
+        self.assertEqual(waits, [3, 3])
 
-    def test_retry_waits_increase_and_never_decrease_if_setting_changes(self):
+    def test_retry_wait_uses_fixed_configured_interval(self):
         class Sender:
             def __init__(self):
                 self.sent = 0
@@ -312,18 +312,15 @@ class LegacyCycleTests(unittest.TestCase):
                 return None
 
         sender = Sender()
-        settings = {
+        loop = bot.AutoLoop(object(), object(), target_mix=1, retry_settings_provider=lambda: {
             "transfer_retry_seconds": 3,
             "transfer_retry_limit": 5,
             "post_transfer_wait_seconds": 0,
-        }
-        loop = bot.AutoLoop(object(), object(), target_mix=1, retry_settings_provider=lambda: settings)
+        })
         waits = []
 
         def record_wait(seconds):
             waits.append(seconds)
-            if len(waits) == 1:
-                settings["transfer_retry_seconds"] = 1
             if len(waits) == 3:
                 loop.stop_requested = True
                 return False
@@ -331,27 +328,37 @@ class LegacyCycleTests(unittest.TestCase):
 
         loop._sleep = record_wait
         self.assertFalse(loop._transfer_available_product(sender, CHILD_DIAL, "P", "P", "test"))
-        self.assertEqual(waits, [3, 4, 5])
+        self.assertEqual(waits, [3, 3, 3])
         self.assertEqual(sender.sent, 2)
 
-    def test_success_reduces_adaptive_delay_for_the_next_operation(self):
+    def test_success_does_not_change_fixed_retry_interval(self):
         class Sender:
+            def __init__(self):
+                self.results = [True, None]
+
             def get_transferable_mix(self, product):
                 return 100
 
             def transfer_mix(self, receiver, amount, product):
-                return True
+                return self.results.pop(0)
 
+        sender = Sender()
         loop = bot.AutoLoop(object(), object(), target_mix=1, retry_settings_provider=lambda: {
             "transfer_retry_seconds": 3,
             "transfer_retry_limit": 3,
             "post_transfer_wait_seconds": 0,
         })
-        loop._transfer_backoff_seconds = 6
-        loop._sleep = lambda seconds: True
+        waits = []
 
-        self.assertTrue(loop._transfer_available_product(Sender(), CHILD_DIAL, "P", "P", "test"))
-        self.assertEqual(loop._transfer_backoff_seconds, 5)
+        def stop_after_next_wait(seconds):
+            waits.append(seconds)
+            loop.stop_requested = True
+            return False
+
+        loop._sleep = stop_after_next_wait
+        self.assertTrue(loop._transfer_available_product(sender, CHILD_DIAL, "P", "P", "first"))
+        self.assertFalse(loop._transfer_available_product(sender, CHILD_DIAL, "P", "P", "second"))
+        self.assertEqual(waits, [3])
 
     def test_changed_inquiry_amount_is_used_instead_of_replaying_old_amount(self):
         class Sender:
