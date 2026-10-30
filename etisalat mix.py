@@ -308,7 +308,7 @@ class AutoLoop:
         log_step("فحص النظام الحالي قبل أي عملية...")
         initial = getattr(self, "initial_status", None)
         if initial is None:
-            initial = self.owner.get_status_and_child(timeout=(2, 3))
+            initial = self.owner.get_status_and_child(timeout=(3, 10))
         plan_id, initial_mix, _ = initial
         if self.stopped:
             return

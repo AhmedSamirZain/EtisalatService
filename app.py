@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -49,6 +50,18 @@ class BackgroundRunner:
     def snapshot(self):
         with self._lock:
             return list(self._logs), self._error
+
+    def _read_initial_status(self, owner):
+        """Use a realistic response window and one bounded retry before any actions."""
+        status = (None, 0, None)
+        for attempt in range(2):
+            status = owner.get_status_and_child(timeout=(3, 10))
+            if status[0]:
+                return status
+            if attempt == 0:
+                self.add_log("قراءة البداية لم ترد؛ إعادة الفحص مرة واحدة بمهلة أطول...")
+                time.sleep(1)
+        return status
 
     def start(self, owner_email, owner_password, child_email, child_password, target):
         bot = self._bot_module
@@ -97,7 +110,7 @@ class BackgroundRunner:
                 return
 
             self.add_log("قراءة النظام والرصيد قبل بدء أي تجديد أو تحويل...")
-            initial_status = owner.get_status_and_child(timeout=(2, 3))
+            initial_status = self._read_initial_status(owner)
             plan_id, initial_mix, _ = initial_status
             if not plan_id:
                 raise RuntimeError("تعذرت قراءة النظام الحالي؛ أوقفت التشغيل قبل أي عملية.")
